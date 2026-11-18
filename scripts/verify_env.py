@@ -41,7 +41,7 @@ TOOLS: list[tuple[str, list[str], str]] = [
     ("git", ["git", "--version"], "Version control"),
     ("docker", ["docker", "--version"], "Containerisation"),
     ("docker-compose", ["docker", "compose", "version"], "Multi-container orchestration"),
-    ("kubectl", ["kubectl", "version", "--client=true", "-o", "yaml"], "Kubernetes CLI"),
+    ("kubectl", ["kubectl", "version", "--client=true", "-o", "json"], "Kubernetes CLI"),
 ]
 
 OK = "[ OK ]"
@@ -94,11 +94,23 @@ def check_tools() -> int:
             out = subprocess.run(  # noqa: S603 - fixed, trusted command list
                 cmd, capture_output=True, text=True, timeout=60, check=False
             )
-            first = next(
-                (ln.strip() for ln in out.stdout.splitlines() if ln.strip()),
-                "(no output)",
-            )
-            print(f"{OK} {name:<16} {first}")
+            lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+            if name == "kubectl":
+                # `kubectl version -o json` prints a JSON object; pull out the
+                # client version instead of showing the opening brace.
+                import json
+
+                try:
+                    data = json.loads(out.stdout)
+                    summary = (
+                        "Client Version: "
+                        f"{data['clientVersion']['gitVersion']}"
+                    )
+                except Exception:  # noqa: BLE001
+                    summary = lines[0] if lines else "(no output)"
+            else:
+                summary = lines[0] if lines else "(no output)"
+            print(f"{OK} {name:<16} {summary}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"{BAD} {name:<16} {exc}")
