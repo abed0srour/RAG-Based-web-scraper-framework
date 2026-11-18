@@ -398,45 +398,31 @@ which site a page came from.
 
 ## Screenshot list
 
+Eight figures. Figures 2, 3, 6 and 7 are the ones that demonstrate the four
+requirements of the task — removing markup, normalising to JSON, indexing in a
+NoSQL database and testing processing efficiency — so capture those first.
+
 | # | What to capture | Command / where | Caption for the report |
 |---|-----------------|-----------------|------------------------|
-| 1 | MongoDB added to the infrastructure | `docker compose -f docker/docker-compose.yml up -d mongodb mongo-express` | *Figure 1 — The Phase 3 infrastructure: a MongoDB container is added to the broker and the relational database, published on host port 27018 to avoid the locally installed MongoDB.* |
-| 2 | All containers healthy | `docker compose -f docker/docker-compose.yml ps` | *Figure 2 — RabbitMQ, PostgreSQL and MongoDB all reporting the `healthy` status from their container health checks.* |
-| 3 | The MongoDB service definition | `docker/docker-compose.yml` in VS Code | *Figure 3 — The MongoDB service, its durable volume, its health check and the comment explaining the port choice.* |
-| 4 | `src/processing/cleaner.py` open at the four passes | VS Code | *Figure 4 — Stage 1: the cleaning passes, with the tag lists for executable elements and for layout boilerplate.* |
-| 5 | **Raw HTML next to the clean text for one page** | `python scripts/demo_task3.py --skip-benchmark` (step 1) | *Figure 5 — The effect of the cleaning stage on one real page: 51,274 bytes of raw HTML reduced to 953 characters of text, with 7 `script` elements, 14 comments and the header, footer, aside and 21 form elements removed — 98.1% of the payload was noise.* |
-| 6 | `src/processing/normalizer.py` open at the schema | VS Code | *Figure 6 — Stage 2: the canonical document, the derived identifier and the required-field validator.* |
-| 7 | **The complete normalised JSON document** | `python scripts/demo_task3.py --skip-benchmark` (step 2) | *Figure 7 — The structured JSON produced for that page: identity, metadata, clean text, keywords, statistics, provenance, and the site-specific fields quarantined under `fields`.* |
-| 8 | The same document in MongoDB | `python -m src.processing.report --doc-url https://books.toscrape.com/` | *Figure 8 — The document as it is stored and read back from the NoSQL database.* |
-| 9 | `src/processing/store.py` open at `ensure_indexes` | VS Code | *Figure 9 — Stage 3: the five indexes, including the weighted compound text index and the `language_override` that keeps `lang="en-us"` pages indexable.* |
-| 10 | A full processing run | `python -m src.processing.pipeline --reset` | *Figure 10 — The pipeline cleaning, normalising and indexing all 45 crawled pages in 0.6 s: 94.7% of 905 KB removed as noise, 8,169 words extracted, with the per-stage p50/p95 latencies.* |
-| 11 | The indexes listed from the database | `python -m src.processing.report` (top) | *Figure 11 — The five indexes created in MongoDB, with the unique constraint on `doc_id`.* |
-| 12 | Documents per site | `python -m src.processing.report` (middle) | *Figure 12 — The processed corpus: 16 documents for `books.toscrape.com` with 98.2% of their bytes removed, 29 for `quotes.toscrape.com` with 79.1% — the cost of markup differs sharply between the two site structures.* |
-| 13 | Duplicate detection | `python -m src.processing.report` (middle) | *Figure 13 — The content hash identifies `/` and `/index.html` as serving byte-identical content, a near-duplicate found without comparing documents.* |
-| 14 | **A full-text query answered by the index** | `python -m src.processing.report --search "fiction"` | *Figure 14 — Keyword retrieval through the weighted text index: the Fiction category page scores 14.71 while a page that merely mentions the word scores 0.50.* |
-| 15 | A sample document summary | `python -m src.processing.report --samples 2` (bottom) | *Figure 15 — Sample documents from both sites, showing the identical top-level schema and the different `fields` keys each site contributes.* |
-| 16 | **Idempotency of the write path** | `python scripts/demo_task3.py --skip-benchmark` (step 4) | *Figure 16 — Processing the same 45 pages a second time inserts 0 new documents and updates 45; the collection still holds 45. The document key is derived from the canonical URL, so the stage is safe to retry.* |
-| 17 | **The efficiency benchmark** | `python -m src.processing.benchmark --repeat 5` | *Figure 17 — Processing efficiency over different data samples: per site, per document size and per write batch size, with the per-stage latencies and the share of each sample that was noise.* |
-| 18 | The batch-size table on its own | same command, lower half | *Figure 18 — The effect of batching MongoDB writes: 1.401 ms per document one at a time against 0.373 ms in batches of 50, a 3.8× improvement that justifies the default batch size.* |
-| 19 | The saved benchmark report | `python -m src.processing.benchmark --save` then open `data/benchmarks/processing-benchmark-*.json` | *Figure 19 — The machine-readable benchmark report, kept with the run's environment so the numbers in this section are reproducible.* |
-| 20 | The documents in Mongo Express | <http://localhost:8081> → `processed_data` → `documents` | *Figure 20 — The indexed collection browsed in Mongo Express, showing the stored JSON documents.* |
-| 21 | The collection from the Mongo shell | `docker exec -it rag-mongodb mongosh -u scraper -p scraper_pass --authenticationDatabase admin --eval "db.getSiblingDB('processed_data').documents.countDocuments()"` | *Figure 21 — The document count read directly from the database server.* |
-| 22 | An index-backed query plan | `docker exec -it rag-mongodb mongosh -u scraper -p scraper_pass --authenticationDatabase admin --eval "db.getSiblingDB('processed_data').documents.find({\$text:{\$search:'fiction'}}).explain('queryPlanner').queryPlanner.winningPlan"` | *Figure 22 — The query planner confirming that the keyword search is served by the `ix_fulltext` index rather than by a collection scan.* |
-| 23 | The processing test module | `python -m pytest tests/test_processing.py -v` | *Figure 23 — The 68 tests of the data-processing module: cleaning, normalisation, the document store and the pipeline.* |
-| 24 | The whole suite | `python -m pytest -q` | *Figure 24 — The full project test suite after Phase 3: 163 tests passed.* |
-| 25 | The complete demonstration | `python scripts/demo_task3.py` | *Figure 25 — The single command that reproduces the whole phase: cleaning, normalisation, indexing, the idempotency proof, the corpus report and the efficiency benchmark.* |
-| 26 | The commit and push | `git log --oneline` and `git push` output | *Figure 26 — The Phase 3 implementation committed and pushed to the GitHub repository.* |
+| 1 | MongoDB added to the infrastructure, and all services healthy | `docker compose -f docker/docker-compose.yml up -d` ; `docker compose -f docker/docker-compose.yml ps` | *Figure 1 — The Phase 3 infrastructure: a MongoDB container joins the broker and the relational database, published on host port 27018 to avoid a locally installed MongoDB, and all services report the `healthy` status from their container health checks.* |
+| 2 | **Raw HTML beside the clean text for one page** | `python scripts/demo_task3.py --skip-benchmark` (step 1) | *Figure 2 — The effect of the cleaning stage on one real page: 51,274 bytes of raw HTML reduced to 953 characters of text, with 7 `script` elements, 14 HTML comments and the header, footer, aside and 21 form elements removed — 98.1% of the payload was noise.* |
+| 3 | **The complete normalised JSON document** | same run (step 2) | *Figure 3 — The structured JSON produced for that page: identity, cleaned metadata, body text, keywords, statistics, provenance, and the site-specific fields quarantined under `fields` so that the top-level schema is identical for every website.* |
+| 4 | The full processing run, and the idempotency proof below it | same run (steps 3 and 4) | *Figure 4 — The pipeline cleans, normalises and indexes all 45 crawled pages in under a second, removing 94.7% of 905 KB as noise and extracting 8,169 words; processing the same pages again inserts 0 new documents and updates 45, so the collection still holds 45. The document key is derived from the canonical URL, which makes the stage safe to retry after a crash.* |
+| 5 | The indexes, the per-site corpus and the duplicate detection | `python -m src.processing.report` (top and middle) | *Figure 5 — The five MongoDB indexes, including the unique constraint on `doc_id` and the weighted full-text index; 16 documents for `books.toscrape.com` with 98.2% of their bytes removed against 29 for `quotes.toscrape.com` with 79.1%; and the content hash identifying `/` and `/index.html` as serving byte-identical content.* |
+| 6 | **A keyword query answered by the text index** | `python -m src.processing.report --search "fiction"` | *Figure 6 — Retrieval through the weighted full-text index: the Fiction category page scores 14.71 while a page that merely mentions the word scores 0.50. The query is answered by the database, not by scanning documents in Python.* |
+| 7 | **The efficiency benchmark, including the batch-size table** | `python -m src.processing.benchmark --repeat 5` | *Figure 7 — Processing efficiency over different data samples: per source website, per document size and per write batch size. Cleaning is sub-linear in page size (13× larger pages cost 5.8× more), the markup-heavy site yields 98.1% noise against 78.8% for the text-heavy one, and batching 50 documents per write costs 0.373 ms each against 1.401 ms one at a time — a 3.8× improvement that justifies the default batch size.* |
+| 8 | The test suite | `python -m pytest tests/test_processing.py -q` and `python -m pytest -q` | *Figure 8 — The 68 tests of the data-processing module — cleaning, normalisation, the document store and the pipeline — within a project suite of 163 passing tests.* |
 
 > Tips for good screenshots:
-> - Figures 5, 7, 14, 16 and 17 are the ones that demonstrate the four
->   requirements of the task (cleaning, JSON normalisation, NoSQL indexing,
->   efficiency testing). Capture those first.
+> - Figure 4 needs the end of the run summary and the idempotency block in one
+>   frame; run `python scripts/demo_task3.py --skip-benchmark > docs/task3-run.txt`
+>   first and screenshot from the file if the terminal scrolls too fast.
 > - If a `£` sign appears as `?` in the terminal, run
->   `$env:PYTHONIOENCODING="utf-8"` before the command — the data in MongoDB
->   is correct Unicode, it is only the console's code page.
-> - Run `python scripts/demo_task3.py --skip-benchmark > docs/task3-run.txt`
->   once to keep the full transcript, then screenshot the sections from it if
->   the terminal scrolls too fast.
+>   `$env:PYTHONIOENCODING="utf-8"` before the command — the data in MongoDB is
+>   correct Unicode, it is only the console's code page.
+> - Optional extras, if a figure is spare: the collection browsed in Mongo
+>   Express (<http://localhost:8081>), or `explain('queryPlanner')` showing that
+>   the keyword search is served by `ix_fulltext` rather than a collection scan.
 
 ---
 

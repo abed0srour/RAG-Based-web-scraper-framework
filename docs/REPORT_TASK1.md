@@ -159,27 +159,27 @@ implementation of the distributed web scraper.
 
 ## Screenshot list
 
+Eight figures, chosen so that each one carries a different piece of evidence
+for Phase 1. Where a figure combines two commands, run them in the same
+terminal so one screenshot covers both.
+
 | # | What to capture | Command / where | Caption for the report |
 |---|-----------------|-----------------|------------------------|
-| 1 | Versions of Python, Git, Docker, Compose and kubectl in one terminal | `py --version` ; `git --version` ; `docker --version` ; `docker compose version` ; `kubectl version --client` | *Figure 1 — Verification of the installed prerequisites: Python 3.12.10, Git 2.49.0, Docker Engine 29.8.0, Docker Compose v5.5.1 and kubectl v1.36.1.* |
-| 2 | Creating the virtual environment, and the prompt showing `(venv)` | `py -3.12 -m venv venv` then `.\venv\Scripts\Activate.ps1` | *Figure 2 — Creation and activation of the project virtual environment; the `(venv)` prefix confirms the isolated interpreter is in use.* |
-| 3 | Installed packages inside the venv | `pip list` (or the tail of `pip install -r requirements.txt` showing "Successfully installed …") | *Figure 3 — The 98 project dependencies installed inside the virtual environment, including Celery, Redis, FastAPI, Chroma, FastEmbed and the Anthropic SDK.* |
-| 4 | The `requirements.txt` file open in the editor | VS Code | *Figure 4 — `requirements.txt`, grouped by architectural role, pinning the exact version of every direct dependency.* |
-| 5 | The project folder tree in the VS Code explorer, expanded | VS Code sidebar | *Figure 5 — Repository layout: one package per framework component (`scraper`, `worker`, `rag`, `api`, `common`) plus the deployment, test and documentation directories.* |
-| 6 | `src/common/config.py` open in the editor | VS Code | *Figure 6 — The centralised Pydantic settings module; every node of the distributed system reads its broker, vector-store and LLM configuration from this single typed source.* |
-| 7 | Full output of the verification script | `python scripts/verify_env.py` | *Figure 7 — Output of `verify_env.py`: the interpreter, the active virtual environment, all 17 direct dependencies and all external tools report `[ OK ]`.* |
-| 8 | pytest results | `python -m pytest` | *Figure 8 — The Phase 1 test suite: 18 tests passed, confirming the interpreter version, every critical import, the configuration layer and the logging setup.* |
-| 9 | Git initialisation and remote | `git init` ; `git remote -v` ; `git status --short` | *Figure 9 — Initialisation of the local Git repository and its connection to the GitHub remote; the staged file list shows that the virtual environment and the `.env` file are correctly excluded.* |
-| 10 | Commit and push | `git log --oneline` and the `git push -u origin main` output | *Figure 10 — The Task 1 scaffold committed and pushed to the `main` branch of the GitHub repository.* |
-| 11 | The repository as it appears on GitHub | github.com page of the repo | *Figure 11 — The project repository on GitHub after the first push, showing the committed structure and the rendered README.* |
-| 12 | Docker Desktop window: engine running, Kubernetes enabled | Docker Desktop GUI (Settings → Kubernetes) | *Figure 12 — Docker Desktop with the engine running and the built-in single-node Kubernetes cluster enabled.* |
-| 13 | Docker actually running a container | `docker run --rm hello-world` | *Figure 13 — Functional test of the container runtime: the Docker daemon pulls an image from Docker Hub and runs it, confirming the engine works end to end.* |
-| 14 | Kubernetes cluster reachable | `kubectl config get-contexts` ; `kubectl get nodes` | *Figure 14 — The Kubernetes cluster is reachable through the `docker-desktop` context and reports its node in the `Ready` state.* |
-| 15 | `verify_env.py` re-run with the cluster up | `python scripts/verify_env.py` | *Figure 15 — Final environment verification with Kubernetes running: every check passes and the environment is ready for Phase 2.* |
+| 1 | Versions of every prerequisite in one terminal | `py --version` ; `git --version` ; `docker --version` ; `docker compose version` ; `kubectl version --client` | *Figure 1 — Verification of the installed prerequisites: Python 3.12.10, Git 2.49.0, Docker Engine 29.8.0, Docker Compose v5.5.1 and kubectl v1.36.1.* |
+| 2 | The virtual environment created, activated, and the dependencies installed | `py -3.12 -m venv venv` ; `.\venv\Scripts\Activate.ps1` ; tail of `pip install -r requirements.txt` | *Figure 2 — Creation and activation of the isolated project environment, and the successful installation of the pinned dependencies inside it; the `(venv)` prefix confirms the project interpreter is in use.* |
+| 3 | The project tree in the VS Code explorer, expanded | VS Code sidebar | *Figure 3 — Repository layout: one package per framework component (`scraper`, `processing`, `worker`, `rag`, `api`, `common`) plus the deployment, test and documentation directories.* |
+| 4 | `src/common/config.py` open in the editor | VS Code | *Figure 4 — The centralised Pydantic settings module; every node of the distributed system reads its broker, database, vector-store and LLM configuration from this single typed source.* |
+| 5 | Docker and Kubernetes both proven to work | `docker run --rm hello-world` ; `kubectl config get-contexts` ; `kubectl get nodes` | *Figure 5 — Functional test of the deployment platform: the Docker daemon pulls and runs an image, and the built-in Kubernetes cluster is reachable through the `docker-desktop` context with its node in the `Ready` state.* |
+| 6 | Full output of the verification script | `python scripts/verify_env.py` | *Figure 6 — Output of `verify_env.py`: the interpreter, the active virtual environment, every direct dependency and every external tool report `[ OK ]`, and the backing services are reachable.* |
+| 7 | The environment test suite | `python -m pytest tests/test_environment.py -q` | *Figure 7 — The environment test suite: 24 tests passed, confirming the interpreter version, every critical import, the configuration layer and the logging setup.* |
+| 8 | The repository on GitHub, and the commit that created it | `git log --oneline` ; the GitHub page of the repository | *Figure 8 — The Phase 1 scaffold committed and pushed to the `main` branch; the virtual environment and the `.env` file are excluded by `.gitignore`.* |
 
-> Tip: take screenshots 1, 2, 3, 7, 8, 9, 10 and 14 in a terminal where the
-> `(venv)` prefix and the project path are visible — it shows the commands were
-> run inside the project's own environment.
+> Tips for good screenshots:
+> - Set the terminal to a dark theme and a reasonably large font; the report is
+>   read on paper or on screen at reduced size.
+> - Figure 2 is easiest to capture by scrolling back to the `(venv)` prompt
+>   right after the install finishes, so the activation and the result are
+>   visible together.
 
 ---
 

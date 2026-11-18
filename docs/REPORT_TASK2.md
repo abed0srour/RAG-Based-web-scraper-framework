@@ -263,48 +263,28 @@ generation.
 
 ## Screenshot list
 
+Eight figures, one per claim the phase has to support: the infrastructure, the
+message queue as the URL frontier, dynamic URL management, the distributed
+crawl, the extraction, the storage and the tests. Figure 4 is the single most
+important one.
+
 | # | What to capture | Command / where | Caption for the report |
 |---|-----------------|-----------------|------------------------|
-| 1 | The infrastructure containers starting | `docker compose -f docker/docker-compose.yml up -d` | *Figure 1 — Starting the Phase 2 infrastructure: the RabbitMQ broker and the PostgreSQL database are created as containers from `docker/docker-compose.yml`.* |
-| 2 | Both containers healthy | `docker compose -f docker/docker-compose.yml ps` | *Figure 2 — Both backing services report the `healthy` status from their container health checks; RabbitMQ is published on 5672/15672 and PostgreSQL on host port 5433.* |
-| 3 | `docker-compose.yml` open in the editor | VS Code | *Figure 3 — The infrastructure definition, including the durable volumes and the health checks that let the rest of the system wait for the services to be ready.* |
-| 4 | RabbitMQ management UI, Overview tab | <http://localhost:15672> (`scraper` / `scraper_pass`) | *Figure 4 — The RabbitMQ management interface, used throughout the phase to observe the URL frontier.* |
-| 5 | RabbitMQ Queues tab showing both queues | management UI → Queues | *Figure 5 — The two declared queues: `urls.frontier`, the dynamic URL frontier, and `urls.dead-letter`, which receives URLs that failed repeatedly.* |
-| 6 | Creating the database schema | `python -c "from src.storage.database import init_schema; init_schema()"` | *Figure 6 — Creation of the PostgreSQL schema; the four tables of the scraped-data model are created idempotently.* |
-| 7 | The four tables listed in the database | `docker exec -it rag-postgres psql -U scraper -d scraped_data -c "\dt"` | *Figure 7 — The resulting schema in PostgreSQL: `crawl_jobs`, `raw_pages`, `parsed_pages` and `discovered_links`.* |
-| 8 | `src/storage/models.py` open in the editor | VS Code | *Figure 8 — The SQLAlchemy model definitions, including the unique constraint on (`job_id`, `url`) that makes the writes idempotent under at-least-once delivery.* |
-| 9 | Seeding the frontier | `python -m src.scraper.seed_frontier --job-name books-crawl --url https://books.toscrape.com/` | *Figure 9 — The producer publishes the seed URL onto the frontier and registers a crawl job; because seeding is a separate process from crawling, URLs can be added at any time, including to a running crawl.* |
-| 10 | Queue depth after seeding | `python -m src.scraper.seed_frontier --status` | *Figure 10 — The frontier holds the published seed URL, waiting for a worker to claim it.* |
-| 11 | `src/messaging/frontier.py` open at the topology / publish code | VS Code | *Figure 11 — The frontier client: durable queues, persistent messages, publisher confirms, `prefetch=1` for fair dispatch, and the dead-letter route.* |
-| 12 | A single crawler node running, log lines visible | `python -m src.scraper.run_crawler --site books.toscrape.com --max-depth 1 --max-pages 12` | *Figure 12 — One crawler node consuming URLs from the frontier; each `Stored` line is a page committed to PostgreSQL, with its word and link counts.* |
-| 13 | The frontier growing while the crawler runs | `python -m src.scraper.seed_frontier --status` in a second terminal | *Figure 13 — The frontier grows from one seed URL to dozens of entries while the crawl is in progress, because each parsed page publishes its discovered links back onto the queue — dynamic URL management in action.* |
-| 14 | `frontier_spider.py` open at `spider_idle` / `ack_url` | VS Code | *Figure 14 — The spider takes its URLs from RabbitMQ instead of a static `start_urls` list, and acknowledges a message only after the page has been committed to the database.* |
-| 15 | **Two crawler nodes running side by side** (split the terminal, or two windows) | `python -m src.scraper.run_crawler --site quotes.toscrape.com --worker-id w1` and `... --worker-id w2` | *Figure 15 — Two independent crawler processes consuming from the same frontier. RabbitMQ gives each one different URLs, so the work is balanced between them without any coordination between the processes.* |
-| 16 | RabbitMQ UI queue graph during the two-worker crawl | management UI → Queues → `urls.frontier` | *Figure 16 — The frontier queue during the distributed crawl, showing the message rate as the two workers consume URLs and publish newly discovered links.* |
-| 17 | `src/scraper/parser.py` open at the extractor registry | VS Code | *Figure 17 — The parsing layer: BeautifulSoup over the lxml tree builder for metadata, boilerplate removal and links, with per-site lxml XPath extractors registered by hostname.* |
-| 18 | The end-to-end demonstration run | `python scripts/demo_task2.py` | *Figure 18 — The full Phase 2 demonstration: the database and queues are reset, the first site is crawled with one worker and the second with two concurrent workers, and the queue depth is printed as the crawl proceeds.* |
-| 19 | The final report: jobs and per-site totals | `python -m src.storage.report` (top half) | *Figure 19 — Both crawl jobs completed; 16 pages stored for `books.toscrape.com` and 29 for `quotes.toscrape.com`, each with a parsed counterpart, and 1,120 and 602 discovered links respectively.* |
-| 20 | The report's work-distribution table | `python -m src.storage.report` (middle) | *Figure 20 — Pages stored per worker node. Three distinct `hostname:pid` identities appear, and the two concurrent workers on the second site stored 16 and 13 pages — direct evidence that the crawl executed in parallel.* |
-| 21 | The report's sample parsed pages | `python -m src.storage.report` (bottom) | *Figure 21 — Sample parsed pages from each site, showing the different structured fields the per-site extractors produced: price, rating and availability for the e-commerce site; quotes, authors and tags for the content site.* |
-| 22 | Raw HTML actually stored in the database | `docker exec -it rag-postgres psql -U scraper -d scraped_data -c "select id, site, http_status, content_length, left(content_hash,12) as hash, fetched_by from raw_pages order by id limit 10;"` | *Figure 22 — The `raw_pages` table: the unmodified response is kept with its status, size, content hash and the identity of the worker that fetched it.* |
-| 23 | Structured JSONB extraction in the database | `docker exec -it rag-postgres psql -U scraper -d scraped_data -c "select jsonb_pretty(structured_data) from parsed_pages where site='books.toscrape.com' and structured_data ? 'price' limit 1;"` | *Figure 23 — Per-site fields extracted by the lxml XPath extractor and stored as JSONB, which lets two structurally different websites share one table.* |
-| 24 | Quotes extraction in the database | `docker exec -it rag-postgres psql -U scraper -d scraped_data -c "select jsonb_pretty(structured_data) from parsed_pages where site='quotes.toscrape.com' and structured_data ? 'quotes' limit 1;"` | *Figure 24 — The same column for the second website, holding quote texts, authors and tags — the evidence that the framework handles two different site structures.* |
-| 25 | Full test suite | `python -m pytest -q` | *Figure 25 — The Phase 2 test suite: 95 tests passed, covering URL normalisation, the parsers for both sites, queue semantics (redelivery, dead-lettering) and the idempotency of the database writes.* |
-| 26 | Parser / frontier tests in detail | `python -m pytest tests/test_parser.py tests/test_frontier.py -v` | *Figure 26 — Detailed results for the parsing and message-queue test modules.* |
-| 27 | Dead-letter behaviour proven by test | `python -m pytest tests/test_frontier.py -k "dead_letter or redeliver" -v` | *Figure 27 — The fault-tolerance tests: a nacked URL is redelivered to another consumer, and a URL that fails repeatedly is routed to the dead-letter queue instead of being retried forever.* |
-| 28 | Updated environment verification | `python scripts/verify_env.py` (sections 2 and 5) | *Figure 28 — Environment verification extended for Phase 2: Scrapy, Twisted, pika, SQLAlchemy and psycopg are installed, and both backing services are reachable with the four tables present.* |
-| 29 | The commit and push | `git log --oneline` and `git push` output | *Figure 29 — The Phase 2 implementation committed and pushed to the GitHub repository.* |
-| 30 | The repository on GitHub showing the new modules | github.com page of the repo | *Figure 30 — The repository after Phase 2, with the `messaging`, `scraper` and `storage` packages in place.* |
+| 1 | The infrastructure started and healthy | `docker compose -f docker/docker-compose.yml up -d` ; `docker compose -f docker/docker-compose.yml ps` | *Figure 1 — The Phase 2 infrastructure: the RabbitMQ broker and the PostgreSQL database are created as containers from `docker/docker-compose.yml` and both report the `healthy` status from their container health checks.* |
+| 2 | The two queues in the RabbitMQ management UI | <http://localhost:15672> (`scraper` / `scraper_pass`) → Queues | *Figure 2 — The declared queue topology: `urls.frontier`, the dynamic URL frontier the crawlers consume from, and `urls.dead-letter`, which receives URLs that failed repeatedly instead of being retried forever.* |
+| 3 | Seeding the frontier, and the queue depth afterwards | `python -m src.scraper.seed_frontier --job-name books-crawl --url https://books.toscrape.com/` ; `python -m src.scraper.seed_frontier --status` | *Figure 3 — The producer publishes a seed URL onto the frontier and registers a crawl job. Seeding is a separate process from crawling, so URLs can be added at any time, including to a crawl that is already running.* |
+| 4 | **Two crawler nodes running side by side** | two terminals: `python -m src.scraper.run_crawler --site quotes.toscrape.com --worker-id w1` and `... --worker-id w2` | *Figure 4 — Two independent crawler processes consuming from the same frontier. RabbitMQ hands each one different URLs, so the work is balanced between them without any coordination between the processes — the crawl is genuinely distributed.* |
+| 5 | The frontier growing while the crawl runs | `python -m src.scraper.seed_frontier --status` in a third terminal, or the RabbitMQ queue graph | *Figure 5 — The frontier grows from one seed URL to hundreds of entries while the crawl is in progress, because every parsed page publishes its discovered links back onto the queue: dynamic URL management in action.* |
+| 6 | The report: jobs, per-site totals and the work distribution | `python -m src.storage.report` (top and middle) | *Figure 6 — Both crawl jobs completed: 16 pages stored for `books.toscrape.com` and 29 for `quotes.toscrape.com`. The per-node table shows several distinct `hostname:pid` identities, direct evidence that the pages were fetched in parallel by independent worker processes.* |
+| 7 | The structured extraction stored for both sites | `python -m src.storage.report --samples 2` (bottom), or `jsonb_pretty(structured_data)` in `psql` | *Figure 7 — Per-site fields produced by the lxml XPath extractors and stored as JSONB: price, rating and availability for the e-commerce site, quote texts, authors and tags for the content site — two structurally different websites sharing one table.* |
+| 8 | The Phase 2 test suite | `python -m pytest tests/test_parser.py tests/test_frontier.py tests/test_storage.py -q` | *Figure 8 — The Phase 2 test suite: 71 tests passed, covering URL normalisation, the parsers for both sites, queue semantics (redelivery and dead-lettering) and the idempotency of the database writes.* |
 
 > Tips for good screenshots:
-> - Figure 15 is the single most important one — it proves the crawler is
->   distributed. Put two terminals side by side, both running
->   `run_crawler` against the same site, and make sure the different
->   `--worker-id` values are visible in the log lines.
-> - For the `psql` figures, run `docker exec -it rag-postgres psql -U scraper
->   -d scraped_data` once and then type the queries, so the prompt is visible.
-> - Set the terminal to a dark theme and a reasonably large font; the report is
->   read on paper or on screen at reduced size.
+> - Figure 4 proves the crawler is distributed. Put two terminals side by side,
+>   both running `run_crawler` against the same site, and make sure the
+>   different `--worker-id` values are visible in the log lines.
+> - For a `psql` figure, run `docker exec -it rag-postgres psql -U scraper -d
+>   scraped_data` once and then type the query, so the prompt is visible.
 > - If the `£` sign in a price looks like `?` in your terminal, run
 >   `$env:PYTHONIOENCODING="utf-8"` first — the data in the database is
 >   correct, it is only the console's code page.
