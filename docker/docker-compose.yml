@@ -3,6 +3,8 @@
 #
 #   rabbitmq  : message broker holding the dynamic URL frontier queues
 #   postgres  : relational store for the raw extracted HTML and parsed data
+#   mongodb   : NoSQL store for the cleaned, normalised JSON documents
+#   mongo-express : web UI for browsing the document collection
 #
 # Start with:   docker compose -f docker/docker-compose.yml up -d
 # Inspect with: docker compose -f docker/docker-compose.yml ps
@@ -56,6 +58,51 @@ services:
       retries: 12
       start_period: 15s
 
+  mongodb:
+    # The processed documents are JSON objects whose site-specific "fields"
+    # sub-document has a different shape per website, and they are read back
+    # whole. That is a document store's access pattern, not a relational one,
+    # so the processing stage of Task 3 writes here rather than to PostgreSQL.
+    image: mongo:7.0
+    container_name: rag-mongodb
+    restart: unless-stopped
+    ports:
+      # 27017 on the host is already used by a locally installed MongoDB, so
+      # the container is published on 27018 to avoid the clash - the same
+      # reason PostgreSQL is published on 5433. Inside Docker/Kubernetes the
+      # service name and the standard port 27017 are used.
+      - "27018:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: scraper
+      MONGO_INITDB_ROOT_PASSWORD: scraper_pass
+      MONGO_INITDB_DATABASE: processed_data
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mongo-express:
+    # Read-only convenience: makes the indexed documents and the indexes
+    # themselves visible in a browser, which is what the report screenshots.
+    image: mongo-express:1.0.2
+    container_name: rag-mongo-express
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8081:8081"    # http://localhost:8081  (scraper / scraper_pass)
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://scraper:scraper_pass@mongodb:27017/?authSource=admin
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_BASICAUTH_USERNAME: scraper
+      ME_CONFIG_BASICAUTH_PASSWORD: scraper_pass
+
 volumes:
   rabbitmq_data:
   postgres_data:
+  mongo_data:

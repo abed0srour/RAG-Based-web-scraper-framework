@@ -49,6 +49,20 @@ class Settings(BaseSettings):
     postgres_password: str = Field(default="scraper_pass", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="scraped_data", alias="POSTGRES_DB")
 
+    # ---------- MongoDB (NoSQL store for the processed documents) ----------
+    mongo_host: str = Field(default="localhost", alias="MONGO_HOST")
+    mongo_port: int = Field(default=27018, alias="MONGO_PORT")
+    mongo_user: str = Field(default="scraper", alias="MONGO_USER")
+    mongo_password: str = Field(default="scraper_pass", alias="MONGO_PASSWORD")
+    mongo_db: str = Field(default="processed_data", alias="MONGO_DB")
+    mongo_collection: str = Field(default="documents", alias="MONGO_COLLECTION")
+    mongo_auth_source: str = Field(default="admin", alias="MONGO_AUTH_SOURCE")
+    mongo_timeout_ms: int = Field(default=5000, alias="MONGO_TIMEOUT_MS")
+
+    # ---------- Data processing (Task 3) ----------
+    processing_batch_size: int = Field(default=50, alias="PROCESSING_BATCH_SIZE")
+    processing_min_words: int = Field(default=3, alias="PROCESSING_MIN_WORDS")
+
     # ---------- Celery / Redis (used from Task 4 onwards) ----------
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
@@ -73,6 +87,22 @@ class Settings(BaseSettings):
 
     # ---------- Paths ----------
     data_dir: Path = PROJECT_ROOT / "data"
+
+    @property
+    def mongo_uri(self) -> str:
+        """Connection string for the MongoDB document store.
+
+        Credentials are left out when no user is configured, so the same
+        settings object works both against the authenticated container and
+        against a bare local ``mongod`` started without a root user.
+        """
+        if self.mongo_user:
+            credentials = f"{self.mongo_user}:{self.mongo_password}@"
+            auth = f"?authSource={self.mongo_auth_source}"
+        else:
+            credentials = ""
+            auth = ""
+        return f"mongodb://{credentials}{self.mongo_host}:{self.mongo_port}/{auth}"
 
 
 @lru_cache(maxsize=1)

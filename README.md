@@ -16,7 +16,7 @@ and deployed with Docker and Kubernetes.
 | # | Objective | How it is addressed |
 |---|-----------|---------------------|
 | 1 | Implement a scalable and distributed web scraper | Celery worker pool consuming scrape tasks from a Redis broker |
-| 2 | Integrate a RAG-based system to enhance scraped data | Chunking + ONNX embeddings + Chroma vector store + Claude generation |
+| 2 | Integrate a RAG-based system to enhance scraped data | Cleaning + JSON normalisation + MongoDB indexing, then chunking, ONNX embeddings, Chroma vector store and Claude generation |
 | 3 | Ensure fault tolerance and load balancing | Task retries with exponential backoff, acknowledge-late, dead-letter handling, Redis fair dispatch, Kubernetes replicas + probes |
 | 4 | Use a distributed computing model for efficient task execution | Producer / broker / worker (task-queue) model with horizontal scaling |
 | 5 | Provide APIs for data retrieval and analysis | FastAPI service: submit jobs, poll status, search the corpus, ask RAG questions, read metrics |
@@ -64,6 +64,7 @@ A detailed per-phase flowchart is included in the project report
 | HTML parsing / extraction | BeautifulSoup4 (lxml backend) + lxml XPath |
 | Message queuing (URL frontier) | RabbitMQ 3.13 via pika |
 | Raw + parsed data store | PostgreSQL 16 via SQLAlchemy 2 + psycopg 3 |
+| Processed document store (NoSQL) | MongoDB 7 via pymongo (weighted full-text index) |
 | Distributed task queue | Celery 5.4 (from Task 4) |
 | Worker monitoring | Flower, RabbitMQ management UI |
 | Embeddings | FastEmbed (ONNX Runtime, CPU-only) |
@@ -106,15 +107,23 @@ A detailed per-phase flowchart is included in the project report
 │   │   ├── models.py         PostgreSQL schema (4 tables)
 │   │   ├── database.py       Engine, sessions, repository
 │   │   └── report.py         CLI report over the scraped data
-│   ├── worker/               Celery application and distributed tasks (Task 4)
-│   ├── rag/                  Chunking, embeddings, vector store, LLM (Task 3)
-│   └── api/                  FastAPI application (Task 5)
+│   ├── processing/
+│   │   ├── cleaner.py        Stage 1: strip tags, scripts, boilerplate, formatting
+│   │   ├── normalizer.py     Stage 2: canonical JSON document + validation
+│   │   ├── store.py          Stage 3: MongoDB document store and its indexes
+│   │   ├── pipeline.py       Postgres -> clean -> normalise -> MongoDB
+│   │   ├── benchmark.py      Processing-efficiency test over different samples
+│   │   └── report.py         CLI report over the processed documents
+│   ├── worker/               Celery application and distributed tasks (Task 5)
+│   ├── rag/                  Chunking, embeddings, vector store, LLM (Task 4)
+│   └── api/                  FastAPI application (Task 6)
 ├── scripts/
 │   ├── verify_env.py         Environment verification report (Task 1)
-│   └── demo_task2.py         End-to-end Task 2 demonstration on two sites
+│   ├── demo_task2.py         End-to-end Task 2 demonstration on two sites
+│   └── demo_task3.py         End-to-end Task 3 demonstration (cleaning -> index)
 ├── tests/                    pytest test-suite
 ├── docker/
-│   └── docker-compose.yml    RabbitMQ + PostgreSQL infrastructure
+│   └── docker-compose.yml    RabbitMQ + PostgreSQL + MongoDB infrastructure
 ├── k8s/                      Kubernetes manifests (deployments, services, HPA)
 ├── data/                     Local run artefacts and worker logs (git-ignored)
 └── docs/
@@ -305,15 +314,176 @@ report.
 
 ---
 
+## Task 3 - Data processing module
+
+Raw HTML is unusable as it stands: measured over the crawled corpus, **94.7%
+of the stored bytes are markup, scripts, styles and navigation chrome** rather
+than content. This module turns the stored responses into clean, uniform JSON
+documents and indexes them in MongoDB.
+
+### Pipeline
+
+```
+ raw_pages (PostgreSQL)
+        |  server-side cursor, batches of 50
+        v
+ +----------------------------------------------------------+
+ | STAGE 1  cleaner.py        BeautifulSoup + lxml          |
+ |  1. script / style / noscript / iframe / comments        |
+ |  2. nav / header / footer / aside / form (boilerplate)   |
+ |  3. entities, Unicode NFKC, invisible + control chars    |
+ |  4. whitespace, blank lines, nav lines, duplicate lines  |
+ +---------------------------+------------------------------+
+                             v
+ +----------------------------------------------------------+
+ | STAGE 2  normalizer.py     canonical JSON document       |
+ |  doc_id = SHA-1(canonical URL)      -> idempotent writes |
+ |  title, headings, keywords, stats, provenance            |
+ |  site-specific fields quarantined under "fields"         |
+ |  validate_document(): 12 required keys + JSON-encodable  |
+ +---------------------------+------------------------------+
+                             v
+ +----------------------------------------------------------+
+ | STAGE 3  store.py          MongoDB (NoSQL)               |
+ |  bulk ReplaceOne upserts, ordered=False                  |
+ |  5 indexes, including a weighted full-text index         |
+ +---------------------------+------------------------------+
+                             v
+              processed_data.documents  (indexed, searchable)
+```
+
+### 1. Start MongoDB
+
+```bash
+docker compose -f docker/docker-compose.yml up -d mongodb mongo-express
+docker compose -f docker/docker-compose.yml ps
+```
+
+Mongo Express UI: <http://localhost:8081> (`scraper` / `scraper_pass`).
+MongoDB is published on host port **27018** (27017 is commonly taken by a
+locally installed MongoDB, for the same reason PostgreSQL uses 5433).
+
+### 2. Process the crawled pages
+
+```bash
+python -m src.processing.pipeline --reset          # rebuild from scratch
+python -m src.processing.pipeline                  # add / refresh documents
+python -m src.processing.pipeline --site quotes.toscrape.com --limit 50
+python -m src.processing.pipeline --dry-run        # clean + normalise, write nothing
+python -m src.processing.pipeline --sample         # print one stored document
+```
+
+Re-running is safe: the document key is derived from the canonical URL, so a
+second run over the same pages reports `0 new, 45 updated` and the collection
+size does not change. That is what makes the stage retryable after a crash,
+and what keeps at-least-once delivery from the URL frontier from creating
+duplicates.
+
+### 3. Inspect the processed documents
+
+```bash
+python -m src.processing.report                    # corpus + indexes + duplicates
+python -m src.processing.report --search "fiction" # query through the text index
+python -m src.processing.report --doc-url https://books.toscrape.com/
+python -m src.processing.report --json
+```
+
+### 4. Test processing efficiency
+
+```bash
+python -m src.processing.benchmark --repeat 5      # the full suite
+python -m src.processing.benchmark --no-store      # CPU stages only
+python -m src.processing.benchmark --save          # keep the JSON report
+```
+
+The benchmark runs the module over samples that differ along the three axes
+that change the cost of processing a page - the source website, the document
+size and the write batch size - and times each stage separately, because
+cleaning and normalising are CPU-bound while storing is dominated by the round
+trip to MongoDB.
+
+| Sample | Pages | Avg page | Clean p50 | Pages/s | Noise removed |
+|--------|------:|---------:|----------:|--------:|--------------:|
+| `quotes.toscrape.com` | 29 | 5.4 KB | 3.24 ms | 188.3 | 78.8% |
+| `books.toscrape.com` | 16 | 45.5 KB | 21.82 ms | 43.2 | 98.1% |
+| small (< 10 KB) | 23 | 3.7 KB | 3.97 ms | 198.9 | 77.6% |
+| medium (10-40 KB) | 10 | 21.2 KB | 9.50 ms | 78.0 | 92.3% |
+| large (>= 40 KB) | 12 | 48.9 KB | 22.90 ms | 37.1 | 98.1% |
+| **whole corpus** | 45 | 19.6 KB | 6.52 ms | **71.6** | **94.7%** |
+
+Writing in batches of 50 costs 0.373 ms per document against 1.401 ms one at a
+time - a 3.8x improvement, which is why the pipeline batches. Cleaning is
+sub-linear in page size: 13x larger pages cost 5.8x more to clean.
+
+### 5. Run the whole thing end to end
+
+```bash
+python scripts/demo_task3.py                 # everything, including the benchmark
+python scripts/demo_task3.py --skip-benchmark
+```
+
+Shows one page before and after cleaning, prints its complete JSON document,
+rebuilds the collection from every crawled page, proves the write path is
+idempotent, reports the indexed corpus with a full-text query, and runs the
+efficiency benchmark.
+
+### The document schema
+
+Every document has the same top-level keys whatever site it came from; only
+`fields` varies per site.
+
+| Key | Contents |
+|-----|----------|
+| `doc_id` | SHA-1 of the canonical URL - the deterministic primary key |
+| `url`, `original_url`, `site`, `path`, `query` | identity, canonicalised |
+| `title`, `description`, `language`, `headings` | cleaned metadata |
+| `text` | the clean body text |
+| `keywords` | 15 most frequent non-stop-words, boosted in the text index |
+| `fields` | site-specific data (price, rating, quotes, authors, ...) |
+| `content_hash` | SHA-256 of the clean text - change and duplicate detection |
+| `stats` | word / char / line / sentence counts, lexical diversity, reading time |
+| `source` | provenance: raw page id, job, HTTP status, which node fetched it |
+| `processing` | schema and cleaner versions, timings, how much noise was removed |
+
+### MongoDB indexes
+
+| Index | Purpose |
+|-------|---------|
+| `uq_doc_id` (unique) | one document per canonical URL - idempotent writes |
+| `ix_fulltext` (text) | weighted keyword search: title 10, description 5, headings 4, keywords 3, body 1 |
+| `ix_site_processed_at` | per-site listings in recency order |
+| `ix_content_hash` | near-duplicate detection before embedding |
+| `ix_word_count` | range queries over document size |
+
+The text index is created with `language_override="_text_language"`: MongoDB
+otherwise reads the stemming language from a field named `language`, which in
+this schema holds the page's HTML `lang` attribute, and a page declaring
+`lang="en-us"` would be rejected on write.
+
+### Fault tolerance in this module
+
+| Mechanism | Where |
+|-----------|-------|
+| Derived document key | `normalizer.py` - re-processing replaces a document instead of duplicating it |
+| Unique index on `doc_id` | `store.py` - the same guarantee enforced by the database |
+| Unordered bulk writes | `store.py` - one rejected document does not discard its batch |
+| Per-page error isolation | `pipeline.py` - a page that cannot be processed is counted, the run continues |
+| Validation before the write | `normalizer.py` - a malformed document is rejected at the boundary, not discovered by a reader later |
+| Streaming reads | `pipeline.py` - memory is bounded by the batch size, not by the corpus |
+| Short server timeouts | `store.py` - an unreachable database fails fast instead of hanging a worker |
+
+---
+
 ## Roadmap
 
 - [x] **Task 1** - Environment setup (Python, venv, Git/GitHub, Docker, Kubernetes)
 - [x] **Task 2** - Web scraping module (Scrapy, BeautifulSoup/lxml, RabbitMQ, PostgreSQL)
-- [ ] **Task 3** - RAG integration (chunking, embeddings, vector store, LLM)
-- [ ] **Task 4** - Fault tolerance and load balancing
-- [ ] **Task 5** - REST APIs for data retrieval and analysis
-- [ ] **Task 6** - Docker / Kubernetes deployment
-- [ ] **Task 7** - Testing on two different websites
+- [x] **Task 3** - Data processing module (cleaning, JSON normalisation, MongoDB indexing)
+- [ ] **Task 4** - RAG integration (chunking, embeddings, vector store, LLM)
+- [ ] **Task 5** - Fault tolerance and load balancing
+- [ ] **Task 6** - REST APIs for data retrieval and analysis
+- [ ] **Task 7** - Docker / Kubernetes deployment
+- [ ] **Task 8** - Testing on two different websites
 
 ---
 

@@ -14,6 +14,14 @@ import platform
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+# Running a file as a script puts the script's own directory on sys.path, not
+# the current one, so the project root is added explicitly - otherwise the
+# service checks below cannot import the framework's own `src` package.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # (import name, friendly name) pairs for the Python dependencies
 PACKAGES: list[tuple[str, str]] = [
@@ -22,6 +30,7 @@ PACKAGES: list[tuple[str, str]] = [
     ("pika", "pika (RabbitMQ / AMQP client)"),
     ("sqlalchemy", "SQLAlchemy (PostgreSQL ORM)"),
     ("psycopg", "psycopg 3 (PostgreSQL driver)"),
+    ("pymongo", "pymongo (MongoDB document store)"),
     ("celery", "Celery (distributed task queue)"),
     ("redis", "Redis client (broker / backend)"),
     ("flower", "Flower (worker monitoring)"),
@@ -152,12 +161,12 @@ def check_cluster() -> None:
 
 
 def check_services() -> None:
-    """RabbitMQ broker and PostgreSQL reachability (informational).
+    """RabbitMQ, PostgreSQL and MongoDB reachability (informational).
 
-    Both run as containers from ``docker/docker-compose.yml``; start them with
-    ``docker compose -f docker/docker-compose.yml up -d``.
+    All three run as containers from ``docker/docker-compose.yml``; start them
+    with ``docker compose -f docker/docker-compose.yml up -d``.
     """
-    header("5. BACKING SERVICES (broker / database)")
+    header("5. BACKING SERVICES (broker / databases)")
 
     # --- RabbitMQ ---
     try:
@@ -191,6 +200,23 @@ def check_services() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"{BAD} PostgreSQL       : not reachable ({type(exc).__name__})")
         print("       start it with: docker compose -f docker/docker-compose.yml up -d")
+
+    # --- MongoDB (the processed-document store of Task 3) ---
+    try:
+        from src.processing.store import DocumentStore
+
+        store = DocumentStore()
+        if not store.ping():
+            raise RuntimeError("ping failed")
+        print(f"{OK} MongoDB          : {store.server_version()}")
+        print(f"       database               {store.database_name}")
+        print(f"       documents indexed      {store.count()}")
+        print(f"       indexes                "
+              f"{', '.join(i['name'] for i in store.indexes()) or '(none yet)'}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} MongoDB          : not reachable ({type(exc).__name__})")
+        print("       start it with: docker compose -f docker/docker-compose.yml "
+              "up -d mongodb")
 
 
 def main() -> int:
