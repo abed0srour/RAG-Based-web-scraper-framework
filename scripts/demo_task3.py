@@ -26,19 +26,94 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.common.logging_config import quiet_noisy_loggers  # noqa: E402
-from src.processing.benchmark import print_report, run_suite  # noqa: E402
-from src.processing.cleaner import clean_html  # noqa: E402
-from src.processing.normalizer import to_json  # noqa: E402
-from src.processing.pipeline import ProcessingPipeline  # noqa: E402
-from src.processing.report import print_report as print_store_report  # noqa: E402
-from src.processing.store import DocumentStore, StoreUnavailable  # noqa: E402
+# Guard against being launched by the wrong interpreter. Set once a re-launch
+# has happened, so a venv that genuinely lacks the dependencies reports the
+# missing package instead of re-launching itself forever.
+_REEXEC_FLAG = "DEMO_TASK3_REEXEC"
+
+
+def project_python() -> Path | None:
+    """Return the project's own virtual-environment interpreter, if present.
+
+    Same reasoning as in ``scripts/demo_task2.py``: ``sys.executable`` cannot
+    be trusted, because a ``python`` that resolves to the system interpreter -
+    through a shell alias, or a PATH re-ordered after the virtual environment
+    was activated, so the prompt still shows ``(venv)`` - runs this script
+    without the project's dependencies.
+    """
+    candidates = [
+        PROJECT_ROOT / "venv" / "Scripts" / "python.exe",   # Windows
+        PROJECT_ROOT / "venv" / "bin" / "python",           # Linux / macOS
+        PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        PROJECT_ROOT / ".venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def relaunch_in_project_python() -> None:
+    """Re-run this script under the project interpreter when it differs.
+
+    This demonstration imports the framework in-process rather than spawning
+    child processes, so the switch has to happen before those imports are
+    attempted - otherwise the wrong interpreter fails on ``import sqlalchemy``
+    before any of this code runs.
+    """
+    target = project_python()
+    if target is None or os.environ.get(_REEXEC_FLAG):
+        return
+
+    current = Path(sys.executable)
+    try:
+        if target.samefile(current):
+            return
+    except OSError:  # pragma: no cover - one of the paths vanished
+        if str(target).lower() == str(current).lower():
+            return
+
+    print(f"This script was started by {current}")
+    print(f"Re-launching with the project interpreter: {target}\n", flush=True)
+    completed = subprocess.run(  # noqa: S603 - fixed, trusted argument list
+        [str(target), str(Path(__file__).resolve()), *sys.argv[1:]],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, _REEXEC_FLAG: "1"},
+        check=False,
+    )
+    raise SystemExit(completed.returncode)
+
+
+relaunch_in_project_python()
+
+try:
+    from src.common.logging_config import quiet_noisy_loggers  # noqa: E402
+    from src.processing.benchmark import print_report, run_suite  # noqa: E402
+    from src.processing.cleaner import clean_html  # noqa: E402
+    from src.processing.normalizer import to_json  # noqa: E402
+    from src.processing.pipeline import ProcessingPipeline  # noqa: E402
+    from src.processing.report import print_report as print_store_report  # noqa: E402
+    from src.processing.store import DocumentStore, StoreUnavailable  # noqa: E402
+except ImportError as exc:  # pragma: no cover - environment problem, not logic
+    # One clear instruction beats a traceback: at this point the interpreter is
+    # already the project's own, so a missing package means the environment is
+    # incomplete rather than wrongly selected.
+    print(f"ERROR: {exc}", file=sys.stderr)
+    print(
+        f"\nThe interpreter in use is {sys.executable}\n"
+        "Install the project's dependencies into it with:\n"
+        f'  "{project_python() or sys.executable}" -m pip install -r requirements.txt',
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
 
 
 def banner(text: str) -> None:
@@ -151,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-benchmark", action="store_true", help="Leave out the benchmark step."
     )
     args = parser.parse_args(argv)
+
+    print("Distributed RAG-Based Web Scraper Framework")
+    print("Task 3 - data processing module demonstration")
+    print(f"interpreter : {sys.executable}")
 
     quiet_noisy_loggers()
     logging.basicConfig(
