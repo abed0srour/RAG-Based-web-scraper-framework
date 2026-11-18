@@ -31,6 +31,26 @@ class _NodeFilter(logging.Filter):
         return True
 
 
+# Third-party libraries that log every socket operation at INFO level. Left
+# alone they bury the application's own messages, so they are raised to
+# WARNING and only speak up when something is actually wrong.
+NOISY_LOGGERS = (
+    "pika",
+    "pika.adapters",
+    "pika.adapters.blocking_connection",
+    "pika.adapters.utils.io_services_utils",
+    "pika.adapters.utils.connection_workflow",
+    "pika.connection",
+    "pika.channel",
+    "pika.callback",
+    "urllib3",
+    "httpx",
+    "httpcore",
+    "filelock",
+    "asyncio",
+)
+
+
 def setup_logging(component: str = "app", level: int = logging.INFO) -> logging.Logger:
     """Configure the root logger and return a logger for ``component``."""
     root = logging.getLogger()
@@ -42,4 +62,12 @@ def setup_logging(component: str = "app", level: int = logging.INFO) -> logging.
     handler.addFilter(_NodeFilter(component))
     root.addHandler(handler)
 
+    quiet_noisy_loggers()
+
     return logging.getLogger(component)
+
+
+def quiet_noisy_loggers(level: int = logging.WARNING) -> None:
+    """Raise the threshold of chatty third-party loggers."""
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)

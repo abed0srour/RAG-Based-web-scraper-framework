@@ -60,11 +60,12 @@ A detailed per-phase flowchart is included in the project report
 | Layer | Technology |
 |-------|-----------|
 | Language | Python 3.12 |
-| Distributed task queue | Celery 5.4 |
-| Broker / result backend | Redis 7 |
-| Worker monitoring | Flower |
-| HTTP fetching | Requests + Tenacity (retries) |
-| HTML parsing / extraction | BeautifulSoup4, lxml, Trafilatura |
+| Crawling framework | Scrapy 2.12 (Twisted async engine) |
+| HTML parsing / extraction | BeautifulSoup4 (lxml backend) + lxml XPath |
+| Message queuing (URL frontier) | RabbitMQ 3.13 via pika |
+| Raw + parsed data store | PostgreSQL 16 via SQLAlchemy 2 + psycopg 3 |
+| Distributed task queue | Celery 5.4 (from Task 4) |
+| Worker monitoring | Flower, RabbitMQ management UI |
 | Embeddings | FastEmbed (ONNX Runtime, CPU-only) |
 | Vector store | Chroma (client/server mode) |
 | LLM | Anthropic Claude (`claude-sonnet-5-5`) |
@@ -85,18 +86,37 @@ A detailed per-phase flowchart is included in the project report
 ├── requirements.lock.txt     Full resolved dependency snapshot
 ├── .env.example              Template for environment variables
 ├── .gitignore
+├── scrapy.cfg                Scrapy project entry point
 ├── src/
-│   ├── common/               Shared configuration, logging, data models
-│   ├── scraper/              Fetching, parsing and content extraction
-│   ├── worker/               Celery application and distributed tasks
-│   ├── rag/                  Chunking, embeddings, vector store, LLM augmentation
-│   └── api/                  FastAPI application (retrieval + analysis endpoints)
+│   ├── common/
+│   │   ├── config.py         Central Pydantic settings (all components)
+│   │   └── logging_config.py Node-aware logging format
+│   ├── messaging/
+│   │   └── frontier.py       RabbitMQ URL frontier (publish / consume / DLQ)
+│   ├── scraper/
+│   │   ├── settings.py       Scrapy settings (politeness, retries, pipelines)
+│   │   ├── items.py          RawPageItem definition
+│   │   ├── parser.py         BeautifulSoup + lxml extraction, per-site XPath
+│   │   ├── pipelines.py      Parsing pipeline -> PostgreSQL pipeline
+│   │   ├── spiders/
+│   │   │   └── frontier_spider.py   Spider that consumes URLs from RabbitMQ
+│   │   ├── run_crawler.py    Launch one crawler node
+│   │   └── seed_frontier.py  Publish seed URLs / inspect / purge the queues
+│   ├── storage/
+│   │   ├── models.py         PostgreSQL schema (4 tables)
+│   │   ├── database.py       Engine, sessions, repository
+│   │   └── report.py         CLI report over the scraped data
+│   ├── worker/               Celery application and distributed tasks (Task 4)
+│   ├── rag/                  Chunking, embeddings, vector store, LLM (Task 3)
+│   └── api/                  FastAPI application (Task 5)
 ├── scripts/
-│   └── verify_env.py         Environment verification report (Task 1)
+│   ├── verify_env.py         Environment verification report (Task 1)
+│   └── demo_task2.py         End-to-end Task 2 demonstration on two sites
 ├── tests/                    pytest test-suite
-├── docker/                   Dockerfiles and docker-compose stack
+├── docker/
+│   └── docker-compose.yml    RabbitMQ + PostgreSQL infrastructure
 ├── k8s/                      Kubernetes manifests (deployments, services, HPA)
-├── data/                     Local run artefacts (git-ignored)
+├── data/                     Local run artefacts and worker logs (git-ignored)
 └── docs/
     └── screenshots/          Screenshots used in the report
 ```
@@ -175,10 +195,120 @@ kubectl get nodes
 
 ---
 
+## Task 2 - Web scraping module
+
+### Pipeline
+
+```
+ seed_frontier.py            RabbitMQ                 Scrapy spiders
+ (producer)                  "urls.frontier"          (N independent nodes)
+      │                            │                          │
+      │ publish seed URL           │   prefetch=1, one URL     │
+      └───────────────────────────►│──────────────────────────►│ fetch raw HTML
+                                   │                          │
+                                   │   newly discovered links │
+                                   │◄─────────────────────────┤ (dynamic frontier)
+                                   │                          ▼
+                                   │                   ParsingPipeline
+                                   │              BeautifulSoup + lxml XPath
+                                   │                          │
+                                   │                          ▼
+                                   │                   PostgresPipeline
+                                   │                          │
+                                   │  ack only after COMMIT   ▼
+                                   │◄────────────────────  PostgreSQL
+                                   │                   raw_pages
+            on repeated failure    ▼                   parsed_pages
+                            "urls.dead-letter"         discovered_links
+                                                       crawl_jobs
+```
+
+### 1. Start the infrastructure
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml ps
+```
+
+RabbitMQ management UI: <http://localhost:15672> (`scraper` / `scraper_pass`).
+PostgreSQL is published on host port **5433** (5432 is commonly taken by a
+locally installed PostgreSQL).
+
+### 2. Create the database schema
+
+```bash
+python -c "from src.storage.database import init_schema; init_schema()"
+```
+
+### 3. Seed the URL frontier
+
+```bash
+python -m src.scraper.seed_frontier --job-name books-crawl --url https://books.toscrape.com/
+python -m src.scraper.seed_frontier --status      # queue depth
+```
+
+Seeding is a separate process from crawling, which is what makes the URL list
+*dynamic*: this command can be run again at any time - including while
+crawlers are already running - and the new URLs are picked up immediately.
+
+### 4. Run one or more crawler nodes
+
+```bash
+# one node
+python -m src.scraper.run_crawler --site books.toscrape.com --max-depth 2
+
+# a second node, in another terminal, consuming from the same queue
+python -m src.scraper.run_crawler --site books.toscrape.com --worker-id w2
+```
+
+Each process is an independent consumer. RabbitMQ hands each one a different
+URL, so the work is balanced across whichever nodes are available, and no
+coordination between them is required.
+
+### 5. Inspect the stored data
+
+```bash
+python -m src.storage.report              # table report
+python -m src.storage.report --json       # machine-readable
+```
+
+### 6. Run the whole thing end to end
+
+```bash
+python scripts/demo_task2.py
+```
+
+Resets the database and queues, crawls `books.toscrape.com` with one worker,
+then `quotes.toscrape.com` with two workers in parallel, and prints the final
+report.
+
+### Database schema
+
+| Table | Contents |
+|-------|----------|
+| `crawl_jobs` | One row per crawl run (seeds, status, counters) |
+| `raw_pages` | Unmodified HTTP response: status, headers, raw HTML, SHA-256, fetching node |
+| `parsed_pages` | Title, description, language, headings, clean text, word count, per-site JSONB fields |
+| `discovered_links` | Every link found, with its source page (frontier audit trail) |
+
+### Fault tolerance in this module
+
+| Mechanism | Where |
+|-----------|-------|
+| Durable queues, persistent messages | `frontier.py` - the frontier survives a broker restart |
+| Publisher confirms | `frontier.py` - a URL cannot be silently lost on publish |
+| Manual, late acknowledgement | URL acked only after the `COMMIT`, so a crashed worker's URL is redelivered |
+| Dead-letter queue | A URL that fails `MAX_DELIVERY_ATTEMPTS` times is set aside, not retried forever |
+| Idempotent writes | `ON CONFLICT` upserts, so an at-least-once redelivery cannot duplicate a page |
+| HTTP retry + AutoThrottle | `settings.py` - retries 5xx/429 and adapts the request rate |
+| Connection pre-ping | `database.py` - a connection dropped by a restarted database is replaced |
+
+---
+
 ## Roadmap
 
 - [x] **Task 1** - Environment setup (Python, venv, Git/GitHub, Docker, Kubernetes)
-- [ ] **Task 2** - Distributed web scraper implementation
+- [x] **Task 2** - Web scraping module (Scrapy, BeautifulSoup/lxml, RabbitMQ, PostgreSQL)
 - [ ] **Task 3** - RAG integration (chunking, embeddings, vector store, LLM)
 - [ ] **Task 4** - Fault tolerance and load balancing
 - [ ] **Task 5** - REST APIs for data retrieval and analysis

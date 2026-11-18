@@ -8,6 +8,11 @@ import sys
 import pytest
 
 REQUIRED_MODULES = [
+    "scrapy",
+    "twisted",
+    "pika",
+    "sqlalchemy",
+    "psycopg",
     "celery",
     "redis",
     "requests",
@@ -39,9 +44,31 @@ def test_settings_load_with_defaults() -> None:
     from src.common.config import settings
 
     assert settings.llm_model
-    assert settings.celery_broker_url.startswith("redis://")
     assert settings.chroma_port > 0
     assert settings.scraper_max_retries >= 1
+
+    # RabbitMQ (the dynamic URL frontier)
+    assert settings.rabbitmq_host
+    assert settings.rabbitmq_port > 0
+    assert settings.frontier_queue
+    assert settings.frontier_dlq != settings.frontier_queue
+    # prefetch=1 is what spreads URLs evenly across the worker nodes
+    assert settings.frontier_prefetch >= 1
+
+    # PostgreSQL (raw + parsed storage)
+    assert settings.postgres_host
+    assert settings.postgres_port > 0
+    assert settings.postgres_db
+
+
+def test_database_url_is_built_from_settings() -> None:
+    from src.common.config import settings
+    from src.storage.database import database_url
+
+    url = database_url()
+    assert url.startswith("postgresql+psycopg://")
+    assert settings.postgres_db in url
+    assert str(settings.postgres_port) in url
 
 
 def test_logging_setup_tags_component() -> None:

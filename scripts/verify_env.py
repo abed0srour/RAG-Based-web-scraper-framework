@@ -17,6 +17,11 @@ import sys
 
 # (import name, friendly name) pairs for the Python dependencies
 PACKAGES: list[tuple[str, str]] = [
+    ("scrapy", "Scrapy (distributed web crawler)"),
+    ("twisted", "Twisted (Scrapy async engine)"),
+    ("pika", "pika (RabbitMQ / AMQP client)"),
+    ("sqlalchemy", "SQLAlchemy (PostgreSQL ORM)"),
+    ("psycopg", "psycopg 3 (PostgreSQL driver)"),
     ("celery", "Celery (distributed task queue)"),
     ("redis", "Redis client (broker / backend)"),
     ("flower", "Flower (worker monitoring)"),
@@ -146,19 +151,62 @@ def check_cluster() -> None:
                   "(enable Kubernetes in Docker Desktop)")
 
 
+def check_services() -> None:
+    """RabbitMQ broker and PostgreSQL reachability (informational).
+
+    Both run as containers from ``docker/docker-compose.yml``; start them with
+    ``docker compose -f docker/docker-compose.yml up -d``.
+    """
+    header("5. BACKING SERVICES (broker / database)")
+
+    # --- RabbitMQ ---
+    try:
+        from src.messaging.frontier import FrontierQueue
+
+        with FrontierQueue() as frontier:
+            depth = frontier.depth()
+        print(f"{OK} RabbitMQ         : reachable")
+        for key, value in depth.items():
+            print(f"       {key:<22} {value}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} RabbitMQ         : not reachable ({type(exc).__name__})")
+        print("       start it with: docker compose -f docker/docker-compose.yml up -d")
+
+    # --- PostgreSQL ---
+    try:
+        from sqlalchemy import text
+
+        from src.storage.database import get_engine
+
+        with get_engine().connect() as conn:
+            version = conn.execute(text("select version()")).scalar_one()
+            tables = conn.execute(
+                text(
+                    "select table_name from information_schema.tables "
+                    "where table_schema = 'public' order by table_name"
+                )
+            ).scalars().all()
+        print(f"{OK} PostgreSQL       : {version.split(',')[0]}")
+        print(f"       tables                 {', '.join(tables) or '(none yet)'}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} PostgreSQL       : not reachable ({type(exc).__name__})")
+        print("       start it with: docker compose -f docker/docker-compose.yml up -d")
+
+
 def main() -> int:
     print("Distributed RAG-Based Web Scraper Framework")
-    print("Task 1 - Environment verification report")
+    print("Environment verification report")
 
     venv_ok = check_python()
     pkg_failures = check_packages()
     tool_failures = check_tools()
     check_cluster()
+    check_services()
 
     header("SUMMARY")
     total = pkg_failures + tool_failures + (0 if venv_ok else 1)
     if total == 0:
-        print(f"{OK} Environment is fully configured. Ready for Task 2.")
+        print(f"{OK} Environment is fully configured.")
     else:
         print(f"{BAD} {total} issue(s) found - see the FAIL lines above.")
     print()
