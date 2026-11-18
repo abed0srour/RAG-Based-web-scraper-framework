@@ -26,7 +26,32 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = sys.executable
+
+
+def project_python() -> str:
+    """Return the interpreter that has the project's dependencies installed.
+
+    The demo launches its steps as child processes, and those children must
+    use the project's virtual environment. Relying on ``sys.executable`` alone
+    is not enough: if the script is started by a ``python`` that resolves to
+    the system interpreter - which happens when something re-orders PATH after
+    the virtual environment was activated - every child inherits the wrong
+    interpreter and fails with ``ModuleNotFoundError``. So the venv inside the
+    project is preferred whenever it exists, whatever started this script.
+    """
+    candidates = [
+        PROJECT_ROOT / "venv" / "Scripts" / "python.exe",   # Windows
+        PROJECT_ROOT / "venv" / "bin" / "python",           # Linux / macOS
+        PROJECT_ROOT / ".venv" / "Scripts" / "python.exe",
+        PROJECT_ROOT / ".venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
+PYTHON = project_python()
 
 SITES = [
     {
@@ -46,6 +71,26 @@ SITES = [
         "max_depth": 2,
     },
 ]
+
+
+def check_dependencies() -> list[str]:
+    """Return the names of required packages the chosen interpreter cannot import."""
+    required = ["scrapy", "pika", "sqlalchemy", "psycopg", "bs4", "lxml"]
+    probe = (
+        # importlib.util must be imported explicitly: importing the parent
+        # package alone does not make the submodule available.
+        "import importlib.util;"
+        "missing=[m for m in " + repr(required) + " "
+        "if importlib.util.find_spec(m) is None];"
+        "print(','.join(missing))"
+    )
+    result = subprocess.run(  # noqa: S603 - fixed, trusted argument list
+        [PYTHON, "-c", probe],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        return required
+    return [name for name in result.stdout.strip().split(",") if name]
 
 
 def banner(text: str) -> None:
@@ -154,6 +199,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Distributed RAG-Based Web Scraper Framework")
     print("Task 2 - Scraping module demonstration on two websites")
+    print(f"Interpreter: {PYTHON}")
+
+    # Fail fast and clearly rather than letting every step die on an import.
+    missing = check_dependencies()
+    if missing:
+        print()
+        print("ERROR: the interpreter above is missing required packages:")
+        for name in missing:
+            print(f"  - {name}")
+        print()
+        print("Install them into the project virtual environment with:")
+        print(f'  "{PYTHON}" -m pip install -r requirements.txt')
+        return 1
 
     if not args.keep:
         reset_state()
