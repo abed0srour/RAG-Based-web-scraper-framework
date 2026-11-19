@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Prometheus scrape configuration (Task 7).
+#
+# The one decision worth stating: every API replica and every scraper node is
+# scraped *directly*, not through the load balancer. Scraping through Nginx
+# would return whichever replica the balancer happened to pick, so the series
+# would be an unusable mixture of three processes - and "which replica is
+# slow" is the main question per-replica metrics exist to answer.
+# ---------------------------------------------------------------------------
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: rag-scraper
+    environment: development
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  # --- the API replicas --------------------------------------------------
+  # /metrics is deliberately outside the authenticated /v1 surface, so an
+  # orchestrator can read it without holding an API key.
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api1:8080", "api2:8080", "api3:8080"]
+    relabel_configs:
+      # instance becomes "api1" rather than "api1:8080", which is what makes
+      # a Grafana legend readable.
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+        replacement: "$1"
+
+  # --- the load balancer -------------------------------------------------
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+
+  # --- the scraper fleet -------------------------------------------------
+  # Static targets here because this is compose. Under Kubernetes the same
+  # job uses kubernetes_sd_configs, which discovers pods as they are created
+  # and removed - the commented block below is that version.
+  - job_name: scrapers
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["scraper1:9110", "scraper2:9110"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+        replacement: "$1"
+
+  # - job_name: scrapers-kubernetes
+  #   kubernetes_sd_configs:
+  #     - role: pod
+  #       namespaces:
+  #         names: [rag-scraper]
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_pod_label_app]
+  #       action: keep
+  #       regex: scraper
+  #     - source_labels: [__meta_kubernetes_pod_name]
+  #       target_label: instance
+
+  # --- Prometheus itself -------------------------------------------------
+  # Cheap, and it is the series that tells you whether a gap in the graphs
+  # was an outage or a monitoring failure.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

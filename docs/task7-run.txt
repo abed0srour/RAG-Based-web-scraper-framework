@@ -1,0 +1,212 @@
+================================================================
+ Task 7 verification run
+ date:    2026-11-19 20:44 UTC
+ host:    Windows 11, Docker 29.8.0
+ python:  Python 3.12.10
+ cluster: v1.36.1
+================================================================
+
+## 1. The running stack
+
+SERVICE         STATUS
+api1            Up 2 hours (healthy)
+api2            Up 2 hours (healthy)
+api3            Up 2 hours (healthy)
+chroma          Up 4 hours (healthy)
+elasticsearch   Up 2 hours (healthy)
+grafana         Up 2 hours
+kafka           Up 4 minutes (healthy)
+mongo-express   Up 4 hours
+mongodb         Up 4 hours (healthy)
+nginx           Up 2 hours (unhealthy)
+postgres        Up 4 hours (healthy)
+prometheus      Up 2 hours (healthy)
+rabbitmq        Up 4 hours (healthy)
+scraper1        Up 2 hours (healthy)
+scraper2        Up 2 hours (healthy)
+
+## 2. Kafka: the topic and the consumer group
+
+Topic: urls.frontier	TopicId: sA6B-3hCRZOt23SjSpvKyA	PartitionCount: 6	ReplicationFactor: 1	Configs: 
+	Topic: urls.frontier	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: urls.frontier	Partition: 1	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: urls.frontier	Partition: 2	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: urls.frontier	Partition: 3	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: urls.frontier	Partition: 4	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: urls.frontier	Partition: 5	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+
+-- group members (two scraper nodes sharing six partitions) --
+
+GROUP           CONSUMER-ID                                               HOST            CLIENT-ID            #PARTITIONS     
+scrapers        scraper-91108bf03582-2676b434-d6c1-4769-b0f7-5bd7d439f852 /172.22.0.16    scraper-91108bf03582 3               
+scrapers        scraper-f2317636768e-c2af59b1-14ee-4986-b017-e50352c2084a /172.22.0.13    scraper-f2317636768e 3               
+
+## 3. Load balancing: 60 concurrent requests over three replicas
+
+replica IPs:
+  rag-api1 = 172.22.0.10
+  rag-api2 = 172.22.0.12
+  rag-api3 = 172.22.0.11
+
+requests served per replica:
+     25 "upstream":"172.22.0.10:8080"
+     15 "upstream":"172.22.0.11:8080"
+     20 "upstream":"172.22.0.12:8080"
+
+## 4. Fault tolerance: killing a replica under traffic
+
+rag-api2 stopped.
+40 requests sent while one replica was down:
+       40 200
+
+upstreams in the access log (two addresses on one line = proxy_next_upstream
+retried the request on another replica; the client never saw a failure):
+       16 "upstream":"172.22.0.10:8080"
+       15 "upstream":"172.22.0.11:8080"
+        3 "upstream":"172.22.0.12:8080, 172.22.0.10:8080"
+        6 "upstream":"172.22.0.12:8080, 172.22.0.11:8080"
+
+rag-api2 restarted; it is back in rotation:
+        7 "upstream":"172.22.0.10:8080"
+        8 "upstream":"172.22.0.11:8080"
+        9 "upstream":"172.22.0.12:8080"
+
+## 5. Every replica down: the balancer keeps the API's error envelope
+
+  HTTP/1.1 503 Service Temporarily Unavailable
+  Server: nginx
+  Date: Thu, 19 Nov 2026 20:48:05 GMT
+  Content-Type: application/json
+  Content-Length: 216
+  Connection: keep-alive
+  Retry-After: 10
+  
+  {"error":{"status":503,"type":"no_backend_available",...}}
+
+## 6. The rate limit is shared across replicas (Redis-backed)
+
+  limit: 120 requests / 60s per key, three replicas.
+  with per-replica in-memory counters, all 150 would have been allowed.
+
+  150 requests:
+        120 200
+         30 429
+  spread over:
+         46 "upstream":"172.22.0.10:8080"
+         49 "upstream":"172.22.0.11:8080"
+         55 "upstream":"172.22.0.12:8080"
+
+## 7. Auto-restart: detecting a node that is running but wedged
+
+  A crawler node was started, left to store pages, then its crawl process
+  was frozen with SIGSTOP. The container keeps running throughout - which
+  is what every existence-based check sees - while no page is stored.
+
+  the probe reads a heartbeat written when a page is committed:
+
+  t+60s state=running health=healthy 
+  t+120s state=running health=healthy 
+  t+180s state=running health=healthy 
+  t+240s state=running health=unhealthy 
+  t+300s state=running health=unhealthy 
+  t+360s state=running health=unhealthy 
+
+  the same probe, run by hand inside that still-frozen container:
+
+    wedge-test: stale - no page finished in 394s (limit 180s)
+    exit code: 1  (non-zero is what Kubernetes restarts on)
+
+  meanwhile the two healthy fleet nodes:
+    NODE                                   AGE   PAGES        UP  STATE
+    scraper1                                5s     481     5966s  ok
+    
+    1/1 node(s) making progress
+    restarts: scraper1=0 scraper2=0
+
+## 8. Monitoring
+
+  Prometheus scrape targets:
+    api          api1                   up
+    api          api2                   up
+    api          api3                   up
+    nginx        nginx-exporter:9113    down
+    prometheus   localhost:9090         up
+    scrapers     scraper1               up
+    scrapers     scraper2               up
+
+  alert rules loaded by Prometheus:
+    3 groups, 13 rules
+     api: ApiReplicaDown, NoApiReplicaAvailable, ApiHighServerErrorRate, ApiLatencyDegraded, ApiReplicaLatencyOutlier, RateLimitRejectionSpike, AuthFailureSpike
+     monitoring: TargetMissing
+     scrapers: ScraperNodeStalled, ScraperFleetEmpty, FrontierBacklogUnattended, FrontierBacklogGrowing, DeadLetteredUrlsRising
+
+  live values:
+    sum by (instance) (api_requests_total)
+        api3                 81
+        api1                 72
+        api2                 77
+    sum(api_rate_limited_total)
+        total                30
+    sum by (instance) (scraper_pages_stored_total)
+        scraper1             101
+        scraper2             14
+    sum(scraper_urls_published_total)
+        total                9545
+    sum by (queue) (scraper_frontier_depth)
+        urls.frontier        14960
+        urls.dead-letter     0
+
+  Grafana provisioning (from files in docker/grafana/, not clicked in):
+    datasource Prometheus uid=prometheus url=http://prometheus:9090 default=True
+    dashboard  'RAG Scraper — system overview' uid=rag-scraper-overview folder=RAG Scraper
+    a panel query, through Grafana's own datasource proxy:
+      status: success
+      scraper1: 101 pages
+      scraper2: 14 pages
+
+## 9. Kubernetes manifests, validated against a real API server
+
+  server: v1.36.1
+  OK   k8s/01-config.yaml  (2 objects)
+  OK   k8s/02-stores.yaml  (14 objects)
+  OK   k8s/10-api.yaml  (4 objects)
+  OK   k8s/11-nginx.yaml  (4 objects)
+  OK   k8s/20-scraper.yaml  (3 objects)
+  OK   k8s/30-monitoring.yaml  (10 objects)
+
+## 10. What this run did NOT verify
+
+  * The Kubernetes restart action itself. The manifests validate against a
+    real 1.36 API server (section 9), and the probe that triggers a restart
+    is shown failing on a wedged node (section 7), but the local cluster is
+    kind-based with its own image store and the connection here was too
+    slow to populate it, so no pod was run from these images.
+  * The nginx-prometheus-exporter target (section 8, 'down'): its image was
+    not pulled for the same reason. Nginx's stub_status endpoint itself is
+    served and reachable.
+  * The HorizontalPodAutoscalers. The scraper's external-metric trigger
+    needs prometheus-adapter installed in the cluster.
+
+## 11. Bugs this run found, which no test had caught
+
+  1. Kafka's EXTERNAL listener was never published, so no client outside
+     the compose network could reach the broker.
+  2. A commit rejected after a rebalance (ILLEGAL_GENERATION) escaped and
+     killed a crawler node; it is a routine protocol event.
+  3. depth() joined the consumer group to read offsets, rebalancing the
+     live fleet on every call; it now uses the admin API.
+  4. Nodes exited after ~6s of an empty frontier, and 'restart: always'
+     turned that into a restart loop that rejoined the consumer group
+     every few seconds, so the group never stabilised and no work was
+     picked up (13-14 restarts per node). Nodes now wait indefinitely and
+     write a heartbeat while idle, so 'idle' is distinguishable from
+     'wedged'.
+  5. The compose tmpfs for the heartbeat was root-owned, so the non-root
+     user could not write it and the node was reported unhealthy forever.
+  6. Nginx listened on IPv4 only while its health check resolved localhost
+     to ::1, marking a perfectly healthy balancer unhealthy.
+  7. nginx-exporter depended on a service in a different compose profile,
+     which made 'docker compose --profile monitoring up' an invalid project.
+  8. Redis published on 6379 clashed with another project on this machine.
+  9. 'return' in the nginx config was split over several quoted strings,
+     which nginx does not concatenate - the container would not start.

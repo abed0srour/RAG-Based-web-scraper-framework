@@ -1,0 +1,225 @@
+# ---------------------------------------------------------------------------
+# The scraper fleet, and the auto-restart deliverable of Task 7.
+#
+# The interesting part of this file is the livenessProbe, and specifically
+# what it probes. A crawler node fails in two ways:
+#
+#   1. The process dies. The Deployment replaces the pod; nothing special is
+#      needed, and no probe is involved.
+#   2. The process stays alive and stops working - a socket in a state the
+#      library never times out, a hanging DNS lookup, a deadlock between
+#      Scrapy's reactor and a blocking call. This is the dangerous one,
+#      because a TCP check, an HTTP endpoint and `kubectl get pods` all still
+#      report a healthy pod while the frontier stops moving.
+#
+# So the probe does not ask whether the process exists. It runs
+# src/worker/healthcheck.py, which reads the heartbeat file the crawler
+# writes when a page is committed to PostgreSQL - a progress signal. A wedged
+# node fails it and is restarted.
+# ---------------------------------------------------------------------------
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scraper
+  namespace: rag-scraper
+  labels:
+    app: scraper
+    app.kubernetes.io/name: scraper
+    app.kubernetes.io/part-of: rag-scraper
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scraper
+  # Nodes are interchangeable consumers of a shared queue, so there is no
+  # ordering to preserve on an update: replace them all and let the broker
+  # redistribute. maxUnavailable 1 keeps at least one node fetching.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: scraper
+      annotations:
+        # Scraped by the Prometheus pod-discovery job, so a new replica
+        # starts being monitored without any configuration change.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9110"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Long enough for spider_closed to requeue the URLs this node had
+      # taken but not finished. The frontier is at-least-once regardless,
+      # so this is an optimisation, not the correctness guarantee.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: scraper
+          image: rag-scraper-node:latest
+          # Never for a locally built tag: with Always, the kubelet tries to
+          # pull "latest" from a registry that does not have it and the pod
+          # stays in ErrImagePull.
+          imagePullPolicy: Never
+          args:
+            - python
+            - -m
+            - src.scraper.run_crawler
+            - --max-depth
+            - "2"
+            # 0 = wait indefinitely for work instead of exiting when the
+            # frontier is briefly empty. Exiting looks harmless - the
+            # Deployment just restarts the pod - but every restart rejoins
+            # the Kafka consumer group and triggers a rebalance, and a fleet
+            # doing that every few seconds stays in permanent rebalance and
+            # picks up nothing. An idle node still writes its heartbeat, so
+            # the livenessProbe can tell "idle" from "wedged".
+            - --idle-rounds
+            - "0"
+          envFrom:
+            - configMapRef:
+                name: rag-scraper-config
+            - secretRef:
+                name: rag-scraper-secrets
+          env:
+            # The pod name, so a heartbeat and a metric can be traced back to
+            # a specific replica in kubectl.
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: metrics
+              containerPort: 9110
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+          # ---- the auto-restart mechanism ----
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -m
+                - src.worker.healthcheck
+                - --quiet
+                - --max-age
+                - "180"
+            # A node that has only just started has not finished a page yet.
+            # Probing before this would produce a restart loop that never
+            # reaches the first page.
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 15
+            # Two consecutive failures, so one slow check does not kill a
+            # working node. Together with periodSeconds that is a restart
+            # about a minute after a node goes quiet past the limit.
+            failureThreshold: 2
+
+          # No readinessProbe on purpose: readiness controls whether a pod
+          # receives traffic from a Service, and a scraper receives none -
+          # it pulls work from the broker. A readiness probe here would be
+          # decoration. (The API has both; see 10-api.yaml.)
+
+          volumeMounts:
+            - name: heartbeat
+              mountPath: /var/run/scraper
+      volumes:
+        # emptyDir, so the heartbeat dies with the pod. A heartbeat that
+        # outlived its process would let a restarted node inherit a stale
+        # liveness file and look healthy before it had done anything.
+        - name: heartbeat
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+---
+# A headless Service, purely so Prometheus can discover the pods. Nothing
+# connects *to* a scraper.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scraper-metrics
+  namespace: rag-scraper
+  labels:
+    app: scraper
+spec:
+  clusterIP: None
+  selector:
+    app: scraper
+  ports:
+    - name: metrics
+      port: 9110
+      targetPort: metrics
+---
+# ---------------------------------------------------------------------------
+# Scaling the fleet.
+#
+# CPU is the wrong signal for a crawler: a node waiting politely on a slow
+# site uses almost none, and the queue can still be filling. The right signal
+# is the frontier depth, which is why src/worker/metrics.py exports it.
+#
+# That makes this an external metric, which needs the Prometheus adapter
+# (prometheus-adapter) installed to serve external.metrics.k8s.io. The CPU
+# target is kept as a second trigger so the HPA still does something useful
+# on a cluster without the adapter.
+#
+# maxReplicas is 6 because KAFKA_PARTITIONS is 6: a consumer group cannot
+# use more members than there are partitions, so a seventh pod would idle.
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: scraper
+  namespace: rag-scraper
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: scraper
+  minReplicas: 1
+  maxReplicas: 6
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: scraper_frontier_depth
+        target:
+          # Roughly 200 queued URLs per node before another is added.
+          type: AverageValue
+          averageValue: "200"
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # React quickly: a backlog is work not being done.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Slowly, and this matters more than it looks: removing a consumer
+      # triggers a Kafka rebalance, and a fleet that scales down eagerly
+      # spends its time rebalancing instead of crawling.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

@@ -1,0 +1,203 @@
+# ---------------------------------------------------------------------------
+# Alert rules (Task 7).
+#
+# These are the point of collecting the metrics: a dashboard is only read by
+# someone already looking, and the failures this system actually has are the
+# quiet ones. Each rule below exists because of a specific way the framework
+# can break while still looking alive.
+#
+# `for:` is as important as the expression. A replica restarting during a
+# deploy, or one scrape failing, must not page anyone - so every rule has to
+# stay true for long enough to mean something.
+# ---------------------------------------------------------------------------
+
+groups:
+  # =======================================================================
+  - name: api
+    rules:
+      - alert: ApiReplicaDown
+        expr: up{job="api"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API replica {{ $labels.instance }} is not responding"
+          description: >-
+            Nginx will take it out of rotation after 3 failed requests, so
+            service continues on the remaining replicas. Expected briefly
+            during a restart; investigate if it persists.
+
+      - alert: NoApiReplicaAvailable
+        # The one that matters: the service is down, not degraded.
+        expr: count(up{job="api"} == 1) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Every API replica is down - the service is unavailable"
+          description: >-
+            The balancer has no healthy upstream and is returning its
+            no_backend_available 503 to every client.
+
+      - alert: ApiHighServerErrorRate
+        # Rate over 5 minutes, not a count: a count alerts once and then
+        # keeps alerting on history long after the problem has gone.
+        expr: >-
+          sum(rate(api_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(api_requests_total[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of API responses are 5xx"
+          description: >-
+            Check /health/ready: a dependency outage shows as 503 here, and
+            the readiness endpoint names which store is unreachable.
+
+      - alert: ApiLatencyDegraded
+        # The 95th percentile of everything except /v1/ask, which is slow by
+        # nature (retrieval plus generation) and would mask the rest.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(api_request_duration_seconds_bucket{path!="/v1/ask"}[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p95 latency above 2s (excluding /v1/ask)"
+
+      - alert: ApiReplicaLatencyOutlier
+        # Why metrics are collected per replica rather than through the
+        # balancer: one slow replica is invisible in the aggregate.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le, instance) (rate(api_request_duration_seconds_bucket[5m]))
+          )
+          > 3 * scalar(
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(api_request_duration_seconds_bucket[5m]))
+            )
+          )
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Replica {{ $labels.instance }} is much slower than the pool"
+          description: >-
+            least_conn will already be sending it less traffic. Likely a
+            replica that lost a connection pool or is swapping.
+
+      - alert: RateLimitRejectionSpike
+        expr: sum(rate(api_rate_limited_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Clients are being rate limited steadily"
+          description: >-
+            Either a client is misbehaving or the per-key limit is now too
+            low for legitimate use. api_rate_limited_total carries the
+            bucket and the client name.
+
+      - alert: AuthFailureSpike
+        expr: sum(rate(api_auth_failures_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained authentication failures against the API"
+          description: >-
+            A rotated key that something has not picked up, or someone
+            probing for one.
+
+  # =======================================================================
+  - name: scrapers
+    rules:
+      - alert: ScraperNodeStalled
+        # The failure this whole heartbeat mechanism exists for: the process
+        # is up, the metrics endpoint answers, and no page has been stored.
+        # Kubernetes will restart the pod on the same signal; this alert is
+        # so that a restart *loop* is visible rather than silent.
+        expr: scraper_heartbeat_age_seconds > 180
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scraper {{ $labels.instance }} has stored no page in 3 minutes"
+          description: >-
+            Its livenessProbe should be failing too, so expect a restart.
+            If this keeps firing for the same node, the restart is not
+            fixing the cause.
+
+      - alert: ScraperFleetEmpty
+        expr: absent(scraper_up) or count(scraper_up == 1) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No scraper node is running"
+          description: >-
+            Correct when no crawl is scheduled. A problem if the frontier
+            has a backlog - see FrontierBacklogUnattended.
+
+      - alert: FrontierBacklogUnattended
+        # Work waiting and nothing consuming it. This is the condition a
+        # Kubernetes HPA scales on, so an alert firing here means the
+        # autoscaler is not keeping up or is not running.
+        expr: >-
+          sum(scraper_frontier_depth) > 100
+          and
+          sum(rate(scraper_pages_stored_total[10m])) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "URLs are queued but no node is fetching them"
+          description: >-
+            {{ $value }} URLs outstanding with zero pages stored in ten
+            minutes. Check the scraper pods and the broker.
+
+      - alert: FrontierBacklogGrowing
+        # A crawl discovers links faster than it fetches them for a while -
+        # that is normal at the start. Sustained growth over an hour is not.
+        expr: deriv(sum(scraper_frontier_depth)[1h:5m]) > 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "The frontier has been growing for an hour"
+          description: >-
+            The fleet is not keeping up with link discovery. Add scraper
+            replicas, up to the Kafka partition count.
+
+      - alert: DeadLetteredUrlsRising
+        expr: sum(rate(scraper_urls_dead_lettered_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "URLs are being given up on at a steady rate"
+          description: >-
+            Pages are failing their retries. Usually a site blocking the
+            crawler, a DNS problem, or a changed URL scheme.
+
+  # =======================================================================
+  - name: monitoring
+    rules:
+      - alert: TargetMissing
+        # Without this, a target that disappears from service discovery
+        # simply stops producing data, and every other rule above goes
+        # quiet rather than firing. A silent monitoring system looks exactly
+        # like a healthy one.
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }}/{{ $labels.instance }}"

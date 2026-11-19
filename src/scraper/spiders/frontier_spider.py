@@ -28,18 +28,23 @@ redelivers the URL to another spider instead of losing it.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 import scrapy
 from scrapy import signals
 from scrapy.exceptions import DontCloseSpider
 
-from src.messaging.frontier import FrontierQueue, UrlMessage
+from src.common.config import settings
+from src.messaging.factory import describe_backend, get_frontier
+from src.messaging.frontier import UrlMessage
+from src.worker import metrics
+from src.worker.heartbeat import Heartbeat, node_id
 from src.scraper.items import RawPageItem
 from src.scraper.parser import normalise_url, site_of
 
 
 class FrontierSpider(scrapy.Spider):
-    """Spider whose URL source is the RabbitMQ frontier queue."""
+    """Spider whose URL source is the frontier (RabbitMQ or Kafka)."""
 
     name = "frontier"
 
@@ -74,7 +79,10 @@ class FrontierSpider(scrapy.Spider):
             if s.strip()
         }
 
-        self.frontier = FrontierQueue()
+        # RabbitMQ or Kafka, decided by FRONTIER_BACKEND. The two clients
+        # share an interface, so nothing below this line knows which broker
+        # is carrying the work.
+        self.frontier = get_frontier()
         # url -> delivery_tag, for the late acknowledgement described above.
         self._pending_tags: dict[str, int] = {}
         self._seen_urls: set[str] = set()
@@ -82,6 +90,19 @@ class FrontierSpider(scrapy.Spider):
         self.pages_done = 0
         self.pages_failed = 0
         self.links_published = 0
+
+        # --- node liveness and metrics (Task 7) ---
+        # The heartbeat is written when a page is *stored*, so it reflects
+        # progress rather than the process being alive. That is what lets a
+        # Kubernetes livenessProbe restart a node that is running but wedged.
+        self.node = node_id()
+        self.heartbeat = Heartbeat(self.node) if settings.worker_heartbeat_enabled else None
+        if settings.worker_metrics_enabled:
+            metrics.start_metrics_server(
+                settings.worker_metrics_port,
+                node=self.node,
+                backend=describe_backend()["backend"],
+            )
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -98,8 +119,10 @@ class FrontierSpider(scrapy.Spider):
         """First batch of URLs, taken from the frontier."""
         self.frontier.connect()
         depth = self.frontier.depth()
+        metrics.observe_frontier_depth(depth)
         self.logger.info(
-            "Frontier connected - %s URL(s) waiting, %s consumer(s) attached",
+            "Frontier connected (%s) - %s URL(s) waiting, %s consumer(s) attached",
+            describe_backend()["backend"],
             depth.get(self.frontier.queue), depth.get("consumers"),
         )
         yield from self._requests_from_frontier()
@@ -115,6 +138,40 @@ class FrontierSpider(scrapy.Spider):
             raise DontCloseSpider
 
         self._empty_idle_rounds += 1
+
+        # An idle node is working correctly; it simply has nothing to do. The
+        # heartbeat has to say so, or the liveness probe would treat a quiet
+        # frontier as a wedged crawler and restart a perfectly healthy node
+        # every few minutes. "Alive" therefore means "still polling the
+        # frontier", and a stalled node is one that has stopped even doing
+        # that.
+        if self.heartbeat is not None:
+            self.heartbeat.beat(
+                pages_done=self.pages_done,
+                pages_failed=self.pages_failed,
+                links_published=self.links_published,
+                in_flight=len(self._pending_tags),
+                idle_rounds=self._empty_idle_rounds,
+                state="idle",
+            )
+        metrics.HEARTBEAT_AGE.set(0)
+        metrics.observe_frontier_depth(self._safe_depth())
+
+        # idle_rounds=0 means "wait indefinitely", which is the right
+        # behaviour for a long-lived node under a Deployment: exiting on a
+        # briefly empty frontier gets the container restarted, and every
+        # restart rejoins the Kafka consumer group and triggers a rebalance.
+        # Two nodes doing that every few seconds keep the group in permanent
+        # rebalance and no work is ever picked up - which is exactly what
+        # happened the first time this ran with the default of 3.
+        if self.idle_rounds <= 0:
+            if self._empty_idle_rounds % 30 == 1:
+                self.logger.info(
+                    "Frontier empty (%s round(s)) - waiting for more URLs",
+                    self._empty_idle_rounds,
+                )
+            raise DontCloseSpider
+
         if self._empty_idle_rounds < self.idle_rounds:
             self.logger.info(
                 "Frontier empty (%s/%s) - waiting for more URLs",
@@ -123,6 +180,18 @@ class FrontierSpider(scrapy.Spider):
             raise DontCloseSpider
 
         self.logger.info("Frontier empty for %s rounds - closing", self.idle_rounds)
+
+    def _safe_depth(self) -> dict[str, Any]:
+        """The frontier depth, or an empty mapping if it cannot be read.
+
+        Reporting the queue length must never be able to interrupt a crawl,
+        and on Kafka it is several network round trips.
+        """
+        try:
+            return self.frontier.depth()
+        except Exception as exc:  # noqa: BLE001 - a metric is not worth a crash
+            self.logger.debug("Could not read the frontier depth: %s", exc)
+            return {}
 
     def spider_closed(self, reason: str) -> None:
         """Requeue anything still unacknowledged, then disconnect."""
@@ -141,6 +210,10 @@ class FrontierSpider(scrapy.Spider):
             "Crawl finished (%s): %s page(s) stored, %s failed, %s link(s) published",
             reason, self.pages_done, self.pages_failed, self.links_published,
         )
+        # A deliberate exit must not leave a heartbeat behind to age into a
+        # false alarm about a node that is gone on purpose.
+        if self.heartbeat is not None:
+            self.heartbeat.clear()
         self.frontier.close()
 
     # ------------------------------------------------------------------
@@ -152,7 +225,10 @@ class FrontierSpider(scrapy.Spider):
         if self.max_pages and self.pages_done >= self.max_pages:
             return
 
-        for tag, message in self.frontier.pull(limit=self.batch_size):
+        pulled = self.frontier.pull(limit=self.batch_size)
+        metrics.URLS_PULLED.inc(len(pulled))
+
+        for tag, message in pulled:
             url = message.url
 
             # Already crawled in this process: ack and move on. Cheap
@@ -168,6 +244,7 @@ class FrontierSpider(scrapy.Spider):
 
             self._seen_urls.add(url)
             self._pending_tags[url] = tag
+            metrics.IN_FLIGHT.set(len(self._pending_tags))
 
             yield scrapy.Request(
                 url=url,
@@ -207,6 +284,10 @@ class FrontierSpider(scrapy.Spider):
         item["fetched_at"] = datetime.now(timezone.utc).isoformat()
 
         self.pages_done += 1
+        metrics.PAGES.labels(
+            site=item["site"] or "unknown",
+            outcome="ok" if response.status < 400 else f"http_{response.status}",
+        ).inc()
         yield item
 
         # --- dynamic URL management: feed the frontier from this page ---
@@ -240,6 +321,7 @@ class FrontierSpider(scrapy.Spider):
 
         if published:
             self.links_published += published
+            metrics.URLS_PUBLISHED.labels(site=site or "unknown").inc(published)
             self.logger.debug("Published %s new URL(s) from %s", published, response.url)
 
     def on_error(self, failure):  # type: ignore[no-untyped-def]
@@ -247,6 +329,7 @@ class FrontierSpider(scrapy.Spider):
         request = failure.request
         url = request.url
         self.pages_failed += 1
+        metrics.PAGES.labels(site=site_of(url) or "unknown", outcome="failed").inc()
         self.logger.error("Request failed for %s: %s", url, failure.value)
 
         tag = self._pending_tags.pop(url, None)
@@ -264,6 +347,7 @@ class FrontierSpider(scrapy.Spider):
                 from src.messaging.frontier import MAX_DELIVERY_ATTEMPTS
 
                 if message.attempts >= MAX_DELIVERY_ATTEMPTS:
+                    metrics.DEAD_LETTERED.inc()
                     self.frontier.dead_letter(message, f"fetch failed: {failure.value}")
                 else:
                     self.frontier.publish(message)
@@ -286,3 +370,22 @@ class FrontierSpider(scrapy.Spider):
                 self.frontier.nack(tag, requeue=True)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("Acknowledgement failed for %s: %s", url, exc)
+
+        metrics.IN_FLIGHT.set(len(self._pending_tags))
+        if not success:
+            return
+
+        # A page committed to PostgreSQL is the one unambiguous unit of
+        # progress this node makes, so it is what the liveness signal and
+        # the stored-page counter are driven by - not a request being sent,
+        # which a wedged node can keep doing without finishing anything.
+        metrics.PAGES_STORED.labels(site=site_of(url) or "unknown").inc()
+        metrics.HEARTBEAT_AGE.set(0)
+        if self.heartbeat is not None:
+            self.heartbeat.beat(
+                pages_done=self.pages_done,
+                pages_failed=self.pages_failed,
+                links_published=self.links_published,
+                in_flight=len(self._pending_tags),
+                last_url=url,
+            )

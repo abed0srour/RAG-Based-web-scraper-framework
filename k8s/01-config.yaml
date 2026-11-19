@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Configuration, split the way it has to be: everything that is not a
+# credential in a ConfigMap, the credentials in a Secret.
+#
+# Both are mounted as environment variables rather than files, because
+# src/common/config.py reads its settings from the environment - so the same
+# code runs unchanged locally, under compose and here.
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-scraper-config
+  namespace: rag-scraper
+data:
+  # Inside the cluster every store is reached by its Service name on the
+  # standard port. The odd host ports in docker-compose.yml exist only to
+  # avoid clashing with locally installed databases.
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: scraped_data
+  MONGO_HOST: mongodb
+  MONGO_PORT: "27017"
+  MONGO_DB: processed_data
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  CHROMA_HOST: chroma
+  CHROMA_PORT: "8000"
+  ELASTIC_HOST: elasticsearch
+  ELASTIC_PORT: "9200"
+  REDIS_URL: redis://redis:6379/0
+
+  # --- the frontier -------------------------------------------------------
+  # Kafka here, rather than the RabbitMQ default: a consumer group rebalances
+  # its partitions when a pod is added or lost, which is exactly what a
+  # Deployment whose replica count moves needs. See src/messaging/factory.py.
+  FRONTIER_BACKEND: kafka
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TOPIC: urls.frontier
+  KAFKA_DLQ_TOPIC: urls.dead-letter
+  KAFKA_GROUP_ID: scrapers
+  # The ceiling on scraper parallelism: a group can never have more working
+  # consumers than partitions, so this is also the HPA's maxReplicas.
+  KAFKA_PARTITIONS: "6"
+  KAFKA_REPLICATION_FACTOR: "1"
+
+  # --- worker liveness ----------------------------------------------------
+  HEARTBEAT_DIR: /var/run/scraper
+  WORKER_HEARTBEAT_ENABLED: "true"
+  WORKER_HEARTBEAT_MAX_AGE: "180"
+  WORKER_METRICS_ENABLED: "true"
+  WORKER_METRICS_PORT: "9110"
+
+  # --- the API ------------------------------------------------------------
+  # Redis-backed, because three replicas with in-memory counters would each
+  # allow the full limit and a client would get three times what it was
+  # promised.
+  API_RATE_LIMIT_BACKEND: redis
+  API_WARM_EMBEDDER: "true"
+  API_DOCS_ENABLED: "true"
+  LLM_PROVIDER: extractive
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rag-scraper-secrets
+  namespace: rag-scraper
+type: Opaque
+stringData:
+  # DEVELOPMENT VALUES. These are in version control, so they are not
+  # secrets in any real sense - a deployment that matters creates this
+  # object out of band (sealed-secrets, an external secrets operator, or
+  # `kubectl create secret`) and this file is deleted.
+  POSTGRES_USER: scraper
+  POSTGRES_PASSWORD: scraper_pass
+  MONGO_USER: scraper
+  MONGO_PASSWORD: scraper_pass
+  RABBITMQ_USER: scraper
+  RABBITMQ_PASSWORD: scraper_pass
+  API_KEYS: "reader:dev-reader-key:raw,documents;analyst:dev-analyst-key:raw,documents,search,ask;admin:dev-admin-key:*"
+  # Left empty: with LLM_PROVIDER=extractive the framework uses its free
+  # offline summariser and needs no key at all.
+  ANTHROPIC_API_KEY: ""

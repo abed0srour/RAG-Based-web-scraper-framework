@@ -1,0 +1,16 @@
+# Load every dashboard JSON in the mounted directory, so a dashboard is a
+# file in the repository that can be reviewed in a diff.
+apiVersion: 1
+
+providers:
+  - name: rag-scraper
+    orgId: 1
+    folder: "RAG Scraper"
+    type: file
+    disableDeletion: false
+    # Without this, a dashboard edited in the UI silently diverges from the
+    # file and the next restart appears to "lose" the change.
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

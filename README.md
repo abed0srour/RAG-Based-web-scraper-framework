@@ -587,6 +587,163 @@ index: auth, scopes, validation, paging caps, parameter pass-through and the
 
 ---
 
+## Task 7 - Load balancing and fault tolerance
+
+Four pieces: Nginx in front of replicated API instances, Kafka distributing
+crawl work by partition, a Kubernetes liveness probe that restarts a wedged
+scraper node, and Prometheus + Grafana watching all of it.
+
+### Running it
+
+The Task 7 services sit behind compose profiles, so the default
+`docker compose up -d` still starts only the data stores the earlier tasks
+need.
+
+```bash
+cd docker
+
+# the log-based frontier
+docker compose --profile kafka up -d kafka
+
+# three API replicas behind Nginx, sharing a Redis-backed rate limiter
+docker compose --profile lb up -d --build
+
+# Prometheus (:9090) and Grafana (:3000, admin/admin)
+docker compose --profile monitoring up -d
+
+# two scraper nodes
+FRONTIER_BACKEND=kafka docker compose --profile crawlers up -d --build
+```
+
+The API is still reached on `localhost:8080` — that is the point: the
+balancer took the port the single instance used, and nothing downstream, the
+web UI included, changes.
+
+### Load balancing
+
+| Decision | Why |
+|----------|-----|
+| `least_conn`, not round robin | These requests are not uniform. A RAG `/v1/ask` holds a connection for seconds while a raw-page listing returns in milliseconds, so distributing by **open connections** tracks load where counting requests does not. |
+| Passive health checks (`max_fails=3 fail_timeout=15s`) | Active probing of `/health/ready` is an Nginx Plus feature. The open-source equivalent is this, plus `proxy_next_upstream`, which is what actually makes a client's in-flight request survive a replica dying. |
+| `proxy_next_upstream` **without** `non_idempotent` | A retried `GET` is free. Replaying a `POST /v1/ask` that may already have been processed would double a generation call. |
+| Redis-backed rate limiting | Three replicas with in-memory counters each allow the full limit, so a client would get three times what it was promised. |
+| A JSON 502/503 page | A client that sees Nginx's stock HTML cannot tell a gateway failure from an API failure, and the UI's error handling breaks. The balancer returns the same `{"error": {...}}` envelope the API uses, with `type: no_backend_available`. |
+
+### Kafka: distributing the work
+
+The frontier is now a setting — `FRONTIER_BACKEND=rabbitmq` (Task 2) or
+`kafka` (here) — and both clients implement the same interface, so the
+spider, the seeder and the worker do not know which broker is carrying the
+work. Keeping both is deliberate: they fail differently.
+
+| | RabbitMQ | Kafka |
+|---|----------|-------|
+| Distribution | Competing consumers on one queue | **Partitions assigned** to members of a consumer group |
+| Adding a node | It starts asking for messages | Triggers a rebalance; nothing has to be told |
+| Losing a node | Unacked messages are redelivered | Its partitions are reassigned after `session.timeout.ms` |
+| Per-message retry | Yes, a real nack | No — a partition is an ordered log, so a failed URL is **re-published** with its attempt counter incremented |
+| Ordering | None | Per partition, and the key is the **site** — so one host goes to one node and per-host politeness actually holds |
+
+Three settings carry most of the behaviour:
+
+- **`enable.auto.commit=false`.** An offset advances when the page has been
+  stored, not on a timer. A node that dies mid-request leaves its offsets
+  uncommitted and the URLs are re-delivered — at-least-once, which is why
+  every write downstream is keyed by a deterministic id.
+- **`partition.assignment.strategy=cooperative-sticky`.** Eager rebalancing
+  revokes every assignment from every member, so one new node briefly stops
+  the whole fleet.
+- **The site as the message key.** Kafka's partitioner hashes it, so every
+  URL of one site lands on one partition and therefore one node. Round-robin
+  would scatter a host across the fleet, each node applying its own politeness
+  delay to a server being hit by all of them.
+
+The partition count (`KAFKA_PARTITIONS=6`) is the ceiling on parallelism: a
+group can never have more working members than partitions, which is why the
+scraper autoscaler's `maxReplicas` is also 6.
+
+### Auto-restart: what the probe actually probes
+
+A crawler node fails in two ways, and only one is easy to catch.
+
+If the **process dies**, the Deployment replaces it and no probe is involved.
+The dangerous case is a node that stays alive and stops working — a socket in
+a state the library never times out, a hanging DNS lookup, a deadlock between
+Scrapy's reactor and a blocking call. A TCP check, an HTTP endpoint and
+`kubectl get pods` all report a healthy pod while the frontier stops moving
+and nothing fires.
+
+So the `livenessProbe` in [k8s/20-scraper.yaml](New folder/k8s/20-scraper.yaml)
+runs `python -m src.worker.healthcheck`, which reads a heartbeat file the
+crawler writes **when a page is committed to PostgreSQL**. It is a progress
+signal, not an existence signal.
+
+```bash
+# wedge the crawl without killing the process
+kubectl -n rag-scraper exec deploy/scraper -- pkill -STOP -f run_crawler
+kubectl -n rag-scraper get pods -w          # RESTARTS goes to 1
+```
+
+Supporting details: the heartbeat is written atomically (a probe that read a
+half-written file would declare a healthy node dead), it lives on an
+`emptyDir`/`tmpfs` so it cannot outlive its process, a start-up grace period
+stops a slow first page becoming a restart loop, and the API deliberately
+separates liveness from readiness — a replica whose database is down is taken
+out of rotation, not restarted, because restarting it fixes nothing and loses
+its warm embedding model.
+
+### Monitoring
+
+Every replica and every node is scraped **directly**, not through the
+balancer: scraping through Nginx returns whichever replica it picked, mixing
+three processes into one series and hiding the slow one, which is the main
+question per-replica metrics exist to answer. Under Kubernetes the same job
+discovers pods through the API, so a new replica is monitored with no
+configuration change.
+
+| | |
+|---|---|
+| API series | `api_requests_total`, `api_request_duration_seconds`, `api_rate_limited_total`, `api_auth_failures_total` |
+| Scraper series | `scraper_pages_total`, `scraper_pages_stored_total`, `scraper_frontier_depth`, `scraper_heartbeat_age_seconds`, `scraper_urls_dead_lettered_total` |
+| Dashboard | `docker/grafana/dashboards/rag-scraper.json`, provisioned from the file so it is reviewable in a diff |
+| Alerts | 13 rules in `docker/prometheus/alert_rules.yml` |
+
+The alert rules are the point of collecting any of it — a dashboard is only
+read by someone already looking, and this system's real failures are the
+quiet ones. `ScraperNodeStalled` fires on the same threshold the liveness
+probe uses (so a restart is never a surprise), `FrontierBacklogUnattended`
+catches work queued with nothing consuming it, and `TargetMissing` exists
+because a monitoring system that has stopped scraping looks exactly like a
+healthy one.
+
+### Tests
+
+The whole stack was brought up and exercised for this phase — replicas
+stopped under traffic, a scraper node killed without a clean leave, a crawl
+frozen mid-flight, the manifests validated against a real Kubernetes 1.36 API
+server. The transcript is in [docs/task7-run.txt](New folder/docs/task7-run.txt)
+and the measurements are in
+[docs/REPORT_TASK7.md](New folder/docs/REPORT_TASK7.md). Highlights: 40 of 40
+requests still returned 200 with a replica stopped mid-traffic (9 of them
+retried onto another replica), exactly 120 of 150 requests passed a 120/min
+limit spread over three replicas, a killed Kafka node's partitions were
+reassigned to the survivor, and a frozen crawler was detected while its
+container still reported `running`. **That run found nine defects that review
+and the configuration tests had not** — they are listed in the report, each
+with a regression test.
+
+`tests/test_deployment.py` reads the actual compose file, Nginx config,
+Prometheus rules, dashboard JSON and Kubernetes manifests, and asserts the
+relationships **between** them: that the Nginx upstream names real compose
+services, that the stall alert's threshold equals the liveness probe's, that
+the autoscaler cannot exceed the Kafka partition count, that the metrics port
+agrees across five files, that every dashboard panel queries a metric the
+code actually exports. That class of drift never fails a build — it just
+quietly does the wrong thing — and it is the part of this stack that can be
+checked without a cluster.
+
+---
+
 ## Roadmap
 
 - [x] **Task 1** - Environment setup (Python, venv, Git/GitHub, Docker, Kubernetes)
@@ -595,7 +752,7 @@ index: auth, scopes, validation, paging caps, parameter pass-through and the
 - [x] **Task 4** - RAG integration (chunking, embeddings, Chroma, grounded summaries)
 - [x] **Task 5** - REST API for data access (FastAPI, API keys, rate limiting)
 - [x] **Task 6** - Web UI and full-text search (React, Elasticsearch)
-- [ ] **Task 7** - Load balancing and fault tolerance (Nginx/HAProxy, Kafka, Kubernetes auto-restart, Prometheus/Grafana)
+- [x] **Task 7** - Load balancing and fault tolerance (Nginx, Kafka, Kubernetes auto-restart, Prometheus/Grafana)
 
 ---
 

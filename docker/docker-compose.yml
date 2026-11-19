@@ -181,9 +181,289 @@ services:
       retries: 18
       start_period: 60s
 
+  # =========================================================================
+  # Task 7: dynamic task distribution, load balancing, monitoring
+  #
+  # Everything below is behind a compose profile, so the default
+  # `docker compose up -d` still starts only the data stores the earlier
+  # tasks need. Start a layer when you want it:
+  #
+  #   --profile kafka       the log-based frontier
+  #   --profile lb          three API replicas behind Nginx
+  #   --profile monitoring  Prometheus + Grafana
+  #   --profile crawlers    two scraper nodes
+  #
+  # or all of it:  docker compose -f docker/docker-compose.yml \
+  #                  --profile kafka --profile lb --profile monitoring up -d
+  # =========================================================================
+
+  kafka:
+    # KRaft mode: Kafka is its own controller, so there is no ZooKeeper to
+    # run. One container, one broker, and the partition count in
+    # KAFKA_PARTITIONS is what decides how many scraper nodes can share the
+    # work - not the number of brokers.
+    image: apache/kafka:3.9.0
+    container_name: rag-kafka
+    profiles: ["kafka", "all"]
+    restart: unless-stopped
+    ports:
+      # The EXTERNAL listener, which is the one a client on the host must
+      # use. Publishing the internal 9092 instead would not work: the broker
+      # answers a bootstrap request with the *advertised* address for the
+      # listener that was contacted, so a host client reaching 9092 would be
+      # redirected to "kafka:9092" and fail to resolve it.
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Two listeners on purpose: clients inside the compose network reach
+      # the broker as kafka:9092, clients on the host as localhost:29092.
+      # Kafka hands the advertised address back to the client, so one
+      # listener cannot serve both.
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # A single broker cannot replicate anything, so every internal topic
+      # has to accept a replication factor of one or the broker will not
+      # finish starting.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # The application creates its topics explicitly with the partition
+      # count it needs; auto-creation would silently give them one.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "6"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      CLUSTER_ID: rag-scraper-cluster-01
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL",
+             "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+
+  redis:
+    # Shared state for the API's rate limiter. It matters here rather than
+    # earlier: with one API process an in-memory window is correct, but with
+    # three replicas behind a balancer each would keep its own counters and a
+    # client would get three times the limit it was promised.
+    image: redis:7.4-alpine
+    container_name: rag-redis
+    profiles: ["lb", "monitoring", "all"]
+    restart: unless-stopped
+    ports:
+      # 6380 on the host for the same reason PostgreSQL is on 5433 and
+      # MongoDB on 27018: another project may already hold the standard
+      # port. Inside the compose network it is redis:6379, which is what the
+      # API replicas use, so this mapping is only for inspection from the
+      # host (redis-cli -p 6380).
+      - "6380:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- three identical API replicas -----------------------------------------
+  # Named rather than scaled, so the Nginx upstream can list them and so
+  # stopping one to show failover is a single, obvious command.
+  api1: &api_replica
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    image: rag-scraper-api:latest
+    container_name: rag-api1
+    profiles: ["lb", "all"]
+    restart: unless-stopped
+    environment:
+      API_RATE_LIMIT_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      API_WARM_EMBEDDER: "true"
+      API_CORS_ORIGINS: "*"
+      REPLICA_NAME: api1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8080"
+
+  api2:
+    <<: *api_replica
+    container_name: rag-api2
+    environment:
+      API_RATE_LIMIT_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      API_WARM_EMBEDDER: "true"
+      API_CORS_ORIGINS: "*"
+      REPLICA_NAME: api2
+
+  api3:
+    <<: *api_replica
+    container_name: rag-api3
+    environment:
+      API_RATE_LIMIT_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      API_WARM_EMBEDDER: "true"
+      API_CORS_ORIGINS: "*"
+      REPLICA_NAME: api3
+
+  nginx:
+    # The load balancer. least_conn across the three replicas, passive health
+    # checking, and a retry onto another replica when one fails mid-request.
+    image: nginx:1.27-alpine
+    container_name: rag-nginx
+    profiles: ["lb", "all"]
+    restart: unless-stopped
+    ports:
+      # The API is reached through here, on 8080, exactly as a single
+      # instance was - which is the point: nothing downstream changes.
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+      - api3
+    healthcheck:
+      # 127.0.0.1, not localhost: busybox wget tries ::1 first, and a
+      # connection refused there marks a perfectly healthy balancer
+      # unhealthy. The config also listens on IPv6 now, so either would
+      # work - this one does not depend on that.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # --- scraper nodes --------------------------------------------------------
+  scraper1: &scraper_node
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.scraper
+    image: rag-scraper-node:latest
+    container_name: rag-scraper1
+    profiles: ["crawlers", "all"]
+    # Always, not unless-stopped: a node exits 0 when the frontier has been
+    # empty for a few rounds, and restarting it is correct - it rejoins the
+    # group and waits for work. This is the compose equivalent of what the
+    # Kubernetes Deployment does.
+    restart: always
+    environment:
+      FRONTIER_BACKEND: ${FRONTIER_BACKEND:-rabbitmq}
+      WORKER_ID: scraper1
+      WORKER_METRICS_PORT: 9110
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    tmpfs:
+      # The heartbeat lives here: it must die with the container, or a
+      # restarted node would inherit a stale liveness file.
+      #
+      # The uid/gid/mode are not optional. A tmpfs mount is created fresh and
+      # root-owned, which masks the ownership the Dockerfile set on the
+      # directory, so the non-root user the container runs as cannot write
+      # its heartbeat - the crawl keeps working and the node is reported
+      # unhealthy forever. (Kubernetes avoids this through fsGroup on the
+      # emptyDir; compose needs it spelled out.)
+      - /var/run/scraper:uid=10001,gid=10001,mode=0700
+    expose:
+      - "9110"
+
+  scraper2:
+    <<: *scraper_node
+    container_name: rag-scraper2
+    environment:
+      FRONTIER_BACKEND: ${FRONTIER_BACKEND:-rabbitmq}
+      WORKER_ID: scraper2
+      WORKER_METRICS_PORT: 9110
+
+  # --- monitoring -----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: rag-prometheus
+    profiles: ["monitoring", "all"]
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: rag-grafana
+    profiles: ["monitoring", "all"]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"      # http://localhost:3000  (admin / admin)
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # The dashboard is provisioned from a file, so it is in version
+      # control rather than in a volume nobody can review.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  nginx-exporter:
+    # Turns Nginx's stub_status into Prometheus metrics, so the balancer
+    # appears in the same dashboard as the replicas it fronts.
+    #
+    # It sits in the "lb" profile, not "monitoring", because it depends on
+    # nginx: a service may only depend on another service that is part of the
+    # same enabled profile set, and `--profile monitoring` on its own leaves
+    # nginx undefined, which compose rejects as an invalid project. The
+    # exporter is part of the balancer, and Prometheus simply finds no target
+    # when the balancer is not running.
+    image: nginx/nginx-prometheus-exporter:1.4.0
+    container_name: rag-nginx-exporter
+    profiles: ["lb", "all"]
+    restart: unless-stopped
+    command:
+      - "--nginx.scrape-uri=http://nginx:80/nginx_status"
+    expose:
+      - "9113"
+    depends_on:
+      - nginx
+
 volumes:
   rabbitmq_data:
   postgres_data:
   mongo_data:
   chroma_data:
   elastic_data:
+  kafka_data:
+  prometheus_data:
+  grafana_data:

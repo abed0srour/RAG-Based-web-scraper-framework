@@ -23,7 +23,8 @@ import json
 import sys
 
 from src.common.logging_config import setup_logging
-from src.messaging.frontier import FrontierQueue, UrlMessage
+from src.messaging.factory import get_frontier
+from src.messaging.frontier import UrlMessage
 from src.scraper.parser import normalise_url, site_of
 from src.storage.database import ScrapeRepository, init_schema
 
@@ -72,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Marked crawl job %s as completed", args.finish_job)
         return 0
 
-    with FrontierQueue() as frontier:
+    with get_frontier() as frontier:
 
         if args.purge:
             frontier.purge()

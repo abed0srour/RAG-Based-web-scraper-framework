@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# A scraper node (Task 2), as a container so the fleet can be scaled and
+# restarted by Docker Compose or Kubernetes (Task 7).
+#
+# Build from the repository root:
+#   docker build -f docker/Dockerfile.scraper -t rag-scraper-node .
+# ---------------------------------------------------------------------------
+
+FROM python:3.12-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+# No compiler: every pinned dependency has a manylinux wheel for cp312, so
+# build-essential would add hundreds of megabytes and compile nothing. See
+# the same note in Dockerfile.api.
+COPY requirements.txt .
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install -r requirements.txt
+
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    POSTGRES_HOST=postgres \
+    POSTGRES_PORT=5432 \
+    MONGO_HOST=mongodb \
+    MONGO_PORT=27017 \
+    RABBITMQ_HOST=rabbitmq \
+    KAFKA_BOOTSTRAP_SERVERS=kafka:9092 \
+    # Written on every stored page and read by the health check. An
+    # emptyDir volume in Kubernetes, a tmpfs here: a heartbeat must never
+    # outlive the process it describes.
+    HEARTBEAT_DIR=/var/run/scraper \
+    WORKER_METRICS_PORT=9110
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+COPY src/ ./src/
+COPY scrapy.cfg ./
+
+RUN useradd --create-home --uid 10001 scraper \
+    && mkdir -p /var/run/scraper /app/data \
+    && chown -R scraper:scraper /var/run/scraper /app
+USER scraper
+
+# The Prometheus endpoint for this node.
+EXPOSE 9110
+
+# Liveness by *progress*, not by existence. A node whose process is alive but
+# whose crawl is wedged - a socket that never times out, a deadlock between
+# the reactor and a blocking call - keeps answering every check that asks
+# whether it is running. This one fails, because the heartbeat only advances
+# when a page is committed. Kubernetes runs the same command as its
+# livenessProbe (see k8s/scraper-deployment.yaml).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=2 \
+    CMD python -m src.worker.healthcheck --quiet || exit 1
+
+# --idle-rounds 0 means "wait indefinitely for work" rather than exiting
+# when the frontier is briefly empty. That matters for a long-lived node: an
+# exit gets the container restarted, every restart rejoins the Kafka consumer
+# group, and two nodes restarting every few seconds keep the group in
+# permanent rebalance so no work is ever picked up. The node stays up, and a
+# node that genuinely wedges is dealt with by the HEALTHCHECK above.
+CMD ["python", "-m", "src.scraper.run_crawler", "--max-depth", "2", \
+     "--idle-rounds", "0"]

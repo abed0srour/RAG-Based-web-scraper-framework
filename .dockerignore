@@ -1,0 +1,21 @@
+# Everything that must not reach a build context. The venv alone is ~1 GB,
+# and a stale .env would bake this machine's credentials into an image.
+venv/
+.venv/
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.env
+.env.local
+data/
+docs/
+k8s/
+tests/
+ui/node_modules/
+ui/dist/
+*.log
+*.docx
+README.md
+requirements.lock.txt

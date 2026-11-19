@@ -1,0 +1,192 @@
+# ---------------------------------------------------------------------------
+# The API, replicated.
+#
+# The two probes here do different jobs, and conflating them is the usual
+# mistake:
+#
+#   livenessProbe  -> /health       "is this process alive?"  Failure means
+#                                   restart the container.
+#   readinessProbe -> /health/ready "are its dependencies reachable?"
+#                                   Failure means take it out of the Service's
+#                                   endpoints - but do NOT restart it.
+#
+# Restarting a replica whose database is down fixes nothing, loses its warm
+# embedding model, and turns one outage into a crash loop. Taking it out of
+# rotation is the correct response, and it is also what makes a rolling
+# update safe: a new pod receives no traffic until it can actually serve.
+# ---------------------------------------------------------------------------
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: rag-scraper
+  labels:
+    app: api
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: rag-scraper
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never fewer than the current replica count during an update: the
+      # surge pod has to pass its readiness probe before an old one goes.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Spread the replicas across nodes where possible, so losing one
+      # cluster node does not take the whole pool with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: api
+          image: rag-scraper-api:latest
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef:
+                name: rag-scraper-config
+            - secretRef:
+                name: rag-scraper-secrets
+          env:
+            - name: REPLICA_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              # The embedding model is ~45 MB of ONNX weights held in memory,
+              # which is most of this request.
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+
+          # The model loads at start-up (API_WARM_EMBEDDER), so the first
+          # request pays retrieval only. That start-up is why the readiness
+          # probe has a startupProbe in front of it rather than a long
+          # initialDelay: a slow start must not be mistaken for a hang.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24      # up to two minutes to come up
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            # One failed readiness check is usually a slow store, not an
+            # unusable replica; three in a row is worth acting on.
+            failureThreshold: 3
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              exec:
+                # Give the balancer time to notice the endpoint has gone
+                # before the process stops accepting. Without this, requests
+                # in flight at the moment of deletion become 502s.
+                command: ["sh", "-c", "sleep 5"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: rag-scraper
+  labels:
+    app: api
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# ---------------------------------------------------------------------------
+# A disruption budget, which is the part people leave out.
+#
+# Without it, a node drain can evict all three replicas at once - the
+# Deployment will recreate them, but there is a window with no API at all.
+# This tells the eviction API that two must stay up.
+# ---------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: rag-scraper
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: rag-scraper
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 9
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      # The embedding model takes a second to load, so a replica is
+      # expensive to recreate. Scaling down slowly avoids paying that
+      # repeatedly during normal traffic variation.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

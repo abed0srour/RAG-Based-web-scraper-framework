@@ -50,7 +50,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--idle-rounds", type=int, default=3,
-        help="Idle rounds with an empty frontier before the node exits.",
+        help="Idle rounds with an empty frontier before the node exits. "
+             "0 waits indefinitely, which is what a long-lived node in a "
+             "container should do: exiting gets it restarted, and every "
+             "restart rejoins the broker's consumer group.",
     )
     parser.add_argument(
         "--no-follow", action="store_true",

@@ -48,6 +48,41 @@ class Settings(BaseSettings):
     frontier_dlq: str = Field(default="urls.dead-letter", alias="FRONTIER_DLQ")
     frontier_prefetch: int = Field(default=1, alias="FRONTIER_PREFETCH")
 
+    # ---------- Frontier backend (Task 7) ----------
+    # "rabbitmq" is the Task 2 broker; "kafka" distributes the same work by
+    # partition across a consumer group, which is what lets scraper nodes be
+    # added or lost without a coordinator. See src/messaging/factory.py.
+    frontier_backend: str = Field(default="rabbitmq", alias="FRONTIER_BACKEND")
+
+    # ---------- Kafka (dynamic task distribution, Task 7) ----------
+    kafka_bootstrap_servers: str = Field(
+        default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS"
+    )
+    kafka_topic: str = Field(default="urls.frontier", alias="KAFKA_TOPIC")
+    kafka_dlq_topic: str = Field(default="urls.dead-letter", alias="KAFKA_DLQ_TOPIC")
+    # Every scraper node joins this group, so each partition is assigned to
+    # exactly one of them and the set is rebalanced when a node appears or
+    # dies. The group is the unit of work sharing.
+    kafka_group_id: str = Field(default="scrapers", alias="KAFKA_GROUP_ID")
+    # The partition count is the ceiling on parallelism: a group can never
+    # have more working consumers than there are partitions.
+    kafka_partitions: int = Field(default=6, alias="KAFKA_PARTITIONS")
+    kafka_replication_factor: int = Field(default=1, alias="KAFKA_REPLICATION_FACTOR")
+    kafka_auto_offset_reset: str = Field(
+        default="earliest", alias="KAFKA_AUTO_OFFSET_RESET"
+    )
+    # How long the group coordinator waits before declaring a silent node
+    # dead and reassigning its partitions - the detection half of failover.
+    kafka_session_timeout_ms: int = Field(
+        default=45_000, alias="KAFKA_SESSION_TIMEOUT_MS"
+    )
+    # A consumer that has not polled within this window is treated as stuck
+    # and removed from the group, so one wedged node cannot hold partitions.
+    kafka_max_poll_interval_ms: int = Field(
+        default=300_000, alias="KAFKA_MAX_POLL_INTERVAL_MS"
+    )
+    kafka_poll_timeout: float = Field(default=1.0, alias="KAFKA_POLL_TIMEOUT")
+
     # ---------- PostgreSQL (raw + parsed data) ----------
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5433, alias="POSTGRES_PORT")
@@ -93,6 +128,23 @@ class Settings(BaseSettings):
     rag_candidates: int = Field(default=20, alias="RAG_CANDIDATES")
     rag_index_batch_size: int = Field(default=128, alias="RAG_INDEX_BATCH_SIZE")
     rag_context_chars: int = Field(default=6000, alias="RAG_CONTEXT_CHARS")
+
+    # ---------- Worker liveness and metrics (Task 7) ----------
+    # The heartbeat is written when a page is stored, so it tracks progress
+    # rather than the process existing; src/worker/healthcheck.py reads it and
+    # is what the Kubernetes livenessProbe runs.
+    worker_heartbeat_enabled: bool = Field(
+        default=True, alias="WORKER_HEARTBEAT_ENABLED"
+    )
+    # A node that has stored no page in this long is treated as wedged and
+    # restarted. Generous on purpose: the fetch timeout is 20 s with retries,
+    # and politeness adds a per-host delay, so a healthy node can be quiet.
+    worker_heartbeat_max_age: float = Field(
+        default=180.0, alias="WORKER_HEARTBEAT_MAX_AGE"
+    )
+    worker_metrics_enabled: bool = Field(default=True, alias="WORKER_METRICS_ENABLED")
+    # 9110, not 9100: that one belongs to node_exporter.
+    worker_metrics_port: int = Field(default=9110, alias="WORKER_METRICS_PORT")
 
     # ---------- Full-text search : Elasticsearch (Task 6) ----------
     # The fourth store. MongoDB's text index answers "which documents contain

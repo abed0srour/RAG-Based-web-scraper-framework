@@ -1,0 +1,234 @@
+# ---------------------------------------------------------------------------
+# Nginx in front of the API pods.
+#
+# A fair question: Kubernetes already load-balances a ClusterIP Service, so
+# why run Nginx at all? Because kube-proxy balances *connections* at layer 4,
+# round-robin, with no idea what a request costs. This framework's requests
+# are wildly uneven - a RAG /v1/ask holds a connection for seconds while a
+# raw-page listing returns in milliseconds - so least_conn at layer 7 is a
+# materially better fit, and only a layer-7 proxy can retry a failed request
+# on another replica, set X-Request-ID, or return the API's own JSON error
+# envelope when every backend is down.
+#
+# One honest limitation. Under compose, the upstream lists the three replicas
+# by name and `least_conn` picks between them. In a cluster the pod set
+# changes, and re-resolving an `upstream` server at run time is an Nginx Plus
+# feature (`server ... resolve`) that open-source Nginx does not have. So
+# here the proxy target is the Service address, resolved per request through
+# kube-dns with a variable in `proxy_pass`, which means **kube-proxy chooses
+# the pod** and the per-pod `least_conn` is not in play.
+#
+# Nginx still earns its place: the retry onto another endpoint, X-Request-ID,
+# the edge rate limit, the timeouts and the JSON error envelope are all
+# layer-7 behaviour kube-proxy cannot provide. A deployment that wants
+# pod-aware layer-7 balancing uses an ingress controller, which watches the
+# Endpoints API and rewrites its own upstreams - the Ingress at the bottom of
+# this file is that path.
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: rag-scraper
+data:
+  nginx.conf: |
+    worker_processes auto;
+    events { worker_connections 1024; }
+
+    http {
+      default_type application/json;
+
+      log_format upstream_json escape=json
+        '{"time":"$time_iso8601","request_id":"$request_id",'
+        '"uri":"$request_uri","status":$status,'
+        '"upstream":"$upstream_addr","upstream_status":"$upstream_status",'
+        '"request_time":$request_time}';
+      access_log /dev/stdout upstream_json;
+      error_log  /dev/stderr warn;
+
+      # kube-dns, with a short TTL: the Service address is resolved per
+      # request so that a rescheduled pool is picked up without a reload.
+      # See the header comment for why there is no `upstream` block here.
+      resolver kube-dns.kube-system.svc.cluster.local valid=10s ipv6=off;
+      resolver_timeout 5s;
+
+      limit_req_zone $binary_remote_addr zone=per_ip:10m rate=50r/s;
+      limit_req_status 429;
+
+      server {
+        listen 80 default_server;
+        client_max_body_size 2m;
+
+        # A variable, not a literal: with a literal target Nginx resolves it
+        # once at start-up and keeps the address of a pool that has since
+        # moved. With a variable it goes back to the resolver.
+        set $api_service "api.rag-scraper.svc.cluster.local:8080";
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID      $request_id;
+
+        # Idempotent failures only: replaying a POST /v1/ask that may
+        # already have been processed would double a generation call.
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 3;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 120s;
+
+        location /v1/ {
+          limit_req zone=per_ip burst=100 nodelay;
+          proxy_pass http://$api_service$request_uri;
+        }
+
+        location /health {
+          access_log off;
+          proxy_pass http://$api_service$request_uri;
+        }
+
+        location /metrics {
+          access_log off;
+          proxy_pass http://$api_service$request_uri;
+        }
+
+        location /nginx_status {
+          stub_status;
+          access_log off;
+        }
+
+        location = / { proxy_pass http://$api_service$request_uri; }
+
+        error_page 502 503 504 = @backend_down;
+        location @backend_down {
+          default_type application/json;
+          add_header Retry-After 10 always;
+          # One quoted string on one line: nginx does not concatenate
+          # adjacent string literals, and splitting it is an "invalid number
+          # of arguments" error that stops the container from starting.
+          return 503 '{"error":{"status":503,"type":"no_backend_available","message":"No API replica is currently able to serve this request.","request_id":"$request_id"}}';
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: rag-scraper
+  labels:
+    app: nginx
+spec:
+  # Two, so the load balancer is not itself a single point of failure.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9113"
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /nginx_status
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /nginx_status
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5; nginx -s quit"]
+
+        # The exporter runs beside Nginx rather than as its own Deployment:
+        # it scrapes localhost, so it cannot be pointed at the wrong replica
+        # and its metrics carry that pod's identity.
+        - name: exporter
+          image: nginx/nginx-prometheus-exporter:1.4.0
+          args: ["--nginx.scrape-uri=http://localhost:80/nginx_status"]
+          ports:
+            - name: metrics
+              containerPort: 9113
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: nginx-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: rag-scraper
+  labels:
+    app: nginx
+spec:
+  # NodePort so the stack is reachable on a local cluster (minikube, kind,
+  # Docker Desktop) without an ingress controller installed. Swap for
+  # LoadBalancer on a managed cluster.
+  type: NodePort
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080
+---
+# For a cluster that does have an ingress controller. Harmless if not: an
+# Ingress with no controller is simply never acted on.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-scraper
+  namespace: rag-scraper
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: 2m
+spec:
+  rules:
+    - host: rag-scraper.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx
+                port:
+                  number: 80

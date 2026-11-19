@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rag-scraper
+  labels:
+    name: rag-scraper
+    app.kubernetes.io/part-of: rag-scraper
+---
+# A quota, so a misconfigured autoscaler cannot take the whole node. The
+# scraper's HPA scales on frontier depth, and a backlog of a hundred thousand
+# URLs would otherwise ask for as many pods as the cluster would give it.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: rag-scraper-quota
+  namespace: rag-scraper
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "40"
+    persistentvolumeclaims: "10"
+---
+# Every pod in this namespace gets these defaults unless it sets its own, so
+# a container that forgets to declare resources cannot be scheduled with an
+# unbounded appetite.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: rag-scraper-defaults
+  namespace: rag-scraper
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi

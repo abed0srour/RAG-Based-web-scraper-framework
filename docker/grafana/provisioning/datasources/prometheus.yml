@@ -1,0 +1,22 @@
+# Grafana's data source, provisioned from a file rather than clicked into the
+# UI: a data source configured by hand lives only in Grafana's own database,
+# which means it is not in version control and does not survive the volume
+# being removed.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # A fixed uid, because the dashboard JSON references the data source by
+    # uid. Left unset, Grafana generates a random one and every panel in the
+    # provisioned dashboard shows "datasource not found".
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Must match prometheus.yml's scrape_interval, or Grafana picks step
+      # values that make rate() queries look spiky for no reason.
+      timeInterval: 15s
+      httpMethod: POST
+    editable: false

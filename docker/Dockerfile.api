@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# The API service (Task 5), as a container so it can be replicated behind the
+# load balancer (Task 7) and deployed to Kubernetes.
+#
+# Build from the repository root, not from this directory:
+#   docker build -f docker/Dockerfile.api -t rag-scraper-api .
+# ---------------------------------------------------------------------------
+
+# A two-stage build: the wheels are compiled in the first stage and only the
+# installed packages are copied into the second, so the build tools - which
+# are the larger half of the image - never ship to production.
+FROM python:3.12-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+# No compiler is installed on purpose. Every pinned dependency ships a
+# manylinux wheel for cp312 - lxml, psycopg[binary], onnxruntime behind
+# fastembed, confluent-kafka, uvloop, numpy - so build-essential would add
+# several hundred megabytes and minutes to the build and compile nothing. If
+# a future dependency does need one, it belongs here in the builder stage
+# only, which is what the two stages are for.
+COPY requirements.txt .
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install -r requirements.txt
+
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # Inside the compose network the services are reachable by name on their
+    # standard ports, not on the host ports the compose file publishes.
+    POSTGRES_HOST=postgres \
+    POSTGRES_PORT=5432 \
+    MONGO_HOST=mongodb \
+    MONGO_PORT=27017 \
+    CHROMA_HOST=chroma \
+    ELASTIC_HOST=elasticsearch \
+    RABBITMQ_HOST=rabbitmq \
+    KAFKA_BOOTSTRAP_SERVERS=kafka:9092 \
+    REDIS_URL=redis://redis:6379/0
+
+# curl is needed by the container healthcheck below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+
+# Run as a non-root user: the API reads databases and serves HTTP, and needs
+# to write nothing in the image.
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8080
+
+# The liveness check for the *process*. Readiness - which dependencies are
+# reachable - is /health/ready, and that is what the load balancer and the
+# Kubernetes readiness probe use, because a replica with no database should
+# be taken out of rotation without being restarted.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
+
+# One worker per container. Replicas are containers, not threads, so that a
+# crash takes out one replica and the load balancer routes around it.
+CMD ["uvicorn", "src.api.main:create_app", "--factory", \
+     "--host", "0.0.0.0", "--port", "8080", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]

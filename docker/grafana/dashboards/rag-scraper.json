@@ -1,0 +1,438 @@
+{
+  "uid": "rag-scraper-overview",
+  "title": "RAG Scraper — system overview",
+  "description": "Load balancing, the scraper fleet and the API, in the order you would look at them during an incident: is the service up, is it fast, is the crawl moving, is anything being dropped.",
+  "tags": ["rag-scraper", "task7"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "replica",
+        "label": "API replica",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(up{job=\"api\"}, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Availability",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "API replicas up",
+      "description": "Nginx removes a failed replica from rotation after 3 failures in 15s, so this dropping to 2 is a degradation, not an outage. Zero is an outage.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "count(up{job=\"api\"} == 1)", "legendFormat": "up" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "green", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Scraper nodes working",
+      "description": "Nodes that have stored a page recently. A node whose process is alive but whose crawl is wedged is NOT counted here - that is the difference between this and `kubectl get pods`.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(scraper_heartbeat_age_seconds < 180) or vector(0)",
+          "legendFormat": "working"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Frontier backlog",
+      "description": "URLs published but not finished: RabbitMQ message count, or Kafka consumer-group lag. This is the quantity an autoscaler should act on.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 8, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "sum(scraper_frontier_depth) or vector(0)", "legendFormat": "URLs waiting" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Request rate",
+      "description": "Across every replica, as seen by the API itself.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 13, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(api_requests_total[5m]))", "legendFormat": "req/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "5xx share",
+      "description": "A dependency outage reaches clients as 503, so this rising with a flat request rate usually means a store is down - check /health/ready.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(api_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(api_requests_total[5m])), 0.001)",
+          "legendFormat": "5xx"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "background",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Load balancing",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Requests per replica",
+      "description": "The load-balancing deliverable, made visible: three roughly equal lines, and one of them dropping to zero when a replica is stopped while the others absorb its share.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(api_requests_total{instance=~\"$replica\"}[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Nginx connections and request rate",
+      "description": "From the balancer's own stub_status. A gap between what Nginx accepted and what the replicas report is traffic that never reached a backend.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        { "refId": "A", "expr": "rate(nginx_http_requests_total[5m])", "legendFormat": "requests/s" },
+        { "refId": "B", "expr": "nginx_connections_active", "legendFormat": "active connections" },
+        { "refId": "C", "expr": "nginx_connections_waiting", "legendFormat": "waiting" }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "API latency percentiles",
+      "description": "p50, p95 and p99 over every route. /v1/ask is included here and is legitimately seconds long, so the p99 sits well above the rest whenever the RAG endpoint is in use.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Latency per replica (p95)",
+      "description": "Why metrics are scraped per replica instead of through the balancer: one slow replica disappears into the aggregate above, and least_conn quietly sends it less work rather than telling anyone.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(api_request_duration_seconds_bucket{instance=~\"$replica\"}[5m])))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "lastNotNull"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "The scraper fleet",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Pages stored per second, by node",
+      "description": "Progress, per node. A line going flat while the backlog is non-zero is the stall that the heartbeat liveness probe restarts.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(scraper_pages_stored_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "sum"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Heartbeat age per node",
+      "description": "Seconds since each node last stored a page. The dashed threshold at 180s is the same number the Kubernetes livenessProbe uses, so a line crossing it is a node about to be restarted.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        { "refId": "A", "expr": "scraper_heartbeat_age_seconds", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 180 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Frontier depth",
+      "description": "Per queue or topic. The dead-letter series should be flat at zero; anything else means URLs are being given up on.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (queue) (scraper_frontier_depth)", "legendFormat": "{{queue}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Fetch outcomes and dropped URLs",
+      "description": "Failures separated from successes, plus the dead-letter rate. A rising dead-letter rate usually means a site is blocking the crawler rather than that the crawler is broken.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(scraper_pages_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(scraper_urls_dead_lettered_total[5m]))",
+          "legendFormat": "dead-lettered"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(scraper_urls_published_total[5m]))",
+          "legendFormat": "links discovered"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "dead-lettered" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Refusals",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Rate-limited and rejected requests",
+      "description": "Requests the API turned away on purpose. These are 429s and 401s, not failures - but a sustained rate means either a misbehaving client or a limit that is now too low for real use.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (bucket) (rate(api_rate_limited_total[5m]))",
+          "legendFormat": "rate limited: {{bucket}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(api_auth_failures_total[5m]))",
+          "legendFormat": "auth failed: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    }
+  ]
+}
