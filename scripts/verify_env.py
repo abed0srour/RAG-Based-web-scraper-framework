@@ -161,9 +161,9 @@ def check_cluster() -> None:
 
 
 def check_services() -> None:
-    """RabbitMQ, PostgreSQL and MongoDB reachability (informational).
+    """RabbitMQ, PostgreSQL, MongoDB and Chroma reachability (informational).
 
-    All three run as containers from ``docker/docker-compose.yml``; start them
+    All four run as containers from ``docker/docker-compose.yml``; start them
     with ``docker compose -f docker/docker-compose.yml up -d``.
     """
     header("5. BACKING SERVICES (broker / databases)")
@@ -217,6 +217,36 @@ def check_services() -> None:
         print(f"{BAD} MongoDB          : not reachable ({type(exc).__name__})")
         print("       start it with: docker compose -f docker/docker-compose.yml "
               "up -d mongodb")
+
+    # --- Chroma (the vector store of Task 4) ---
+    try:
+        from src.rag.vector_store import VectorStore
+
+        vectors = VectorStore()
+        if not vectors.ping():
+            raise RuntimeError("heartbeat failed")
+        print(f"{OK} Chroma           : {vectors.server_version()}")
+        print(f"       collection             {vectors.collection_name}")
+        try:
+            print(f"       vectors indexed        {vectors.count()}")
+        except Exception:  # noqa: BLE001 - an empty server has no collection yet
+            print("       vectors indexed        (collection not created yet)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} Chroma           : not reachable ({type(exc).__name__})")
+        print("       start it with: docker compose -f docker/docker-compose.yml "
+              "up -d chroma")
+
+    # --- The embedding model (local, no service) ---
+    try:
+        from src.rag.embedder import get_embedder
+
+        embedder = get_embedder()
+        print(f"{OK} Embedding model  : {embedder.model_name} "
+              f"({embedder.dimension} dims, CPU)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} Embedding model  : not loadable ({type(exc).__name__})")
+        print("       the first run downloads about 45 MB into "
+              f"{PROJECT_ROOT / 'data' / 'models'}")
 
 
 def main() -> int:

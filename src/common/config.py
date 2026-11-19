@@ -27,7 +27,13 @@ class Settings(BaseSettings):
 
     # ---------- LLM ----------
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
-    llm_model: str = Field(default="claude-sonnet-5-5", alias="LLM_MODEL")
+    llm_model: str = Field(default="claude-opus-5-5", alias="LLM_MODEL")
+    # "auto" uses Claude when ANTHROPIC_API_KEY is set and falls back to the
+    # free offline extractive summariser otherwise; "anthropic" and
+    # "extractive" pin one provider. See src/rag/llm.py.
+    llm_provider: str = Field(default="auto", alias="LLM_PROVIDER")
+    llm_max_tokens: int = Field(default=1024, alias="LLM_MAX_TOKENS")
+    llm_effort: str = Field(default="low", alias="LLM_EFFORT")
 
     # ---------- RabbitMQ (dynamic URL frontier) ----------
     rabbitmq_host: str = Field(default="localhost", alias="RABBITMQ_HOST")
@@ -66,14 +72,68 @@ class Settings(BaseSettings):
     # ---------- Celery / Redis (used from Task 4 onwards) ----------
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
-    # ---------- Vector store ----------
+    # ---------- Vector store (Task 4) ----------
     chroma_host: str = Field(default="localhost", alias="CHROMA_HOST")
     chroma_port: int = Field(default=8000, alias="CHROMA_PORT")
     chroma_collection: str = Field(default="scraped_docs", alias="CHROMA_COLLECTION")
+    chroma_timeout: int = Field(default=30, alias="CHROMA_TIMEOUT")
 
-    # ---------- API ----------
+    # ---------- RAG (Task 4) ----------
+    embedding_model: str = Field(
+        default="BAAI/bge-small-en-v1.5", alias="EMBEDDING_MODEL"
+    )
+    embedding_cache_dir: Path = Field(
+        default=PROJECT_ROOT / "data" / "models", alias="EMBEDDING_CACHE_DIR"
+    )
+    embedding_batch_size: int = Field(default=32, alias="EMBEDDING_BATCH_SIZE")
+    chunk_words: int = Field(default=180, alias="CHUNK_WORDS")
+    chunk_overlap_words: int = Field(default=40, alias="CHUNK_OVERLAP_WORDS")
+    chunk_min_words: int = Field(default=20, alias="CHUNK_MIN_WORDS")
+    rag_top_k: int = Field(default=5, alias="RAG_TOP_K")
+    rag_candidates: int = Field(default=20, alias="RAG_CANDIDATES")
+    rag_index_batch_size: int = Field(default=128, alias="RAG_INDEX_BATCH_SIZE")
+    rag_context_chars: int = Field(default=6000, alias="RAG_CONTEXT_CHARS")
+
+    # ---------- API (Task 5) ----------
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8080, alias="API_PORT")
+    api_version: str = Field(default="1.0.0", alias="API_VERSION")
+    api_docs_enabled: bool = Field(default=True, alias="API_DOCS_ENABLED")
+    api_cors_origins: str = Field(default="*", alias="API_CORS_ORIGINS")
+
+    # Authentication. Keys are declared as
+    #   name:key:scope,scope;name:key:scope
+    # and parsed by src/api/security.py. The defaults below are development
+    # keys only - they are printed in the repository, so a real deployment
+    # must set API_KEYS to its own values.
+    api_auth_enabled: bool = Field(default=True, alias="API_AUTH_ENABLED")
+    api_keys: str = Field(
+        default=(
+            "reader:dev-reader-key:raw,documents;"
+            "analyst:dev-analyst-key:raw,documents,search,ask;"
+            "admin:dev-admin-key:*"
+        ),
+        alias="API_KEYS",
+    )
+
+    # Rate limiting. One fixed window per key, plus tighter windows for the
+    # two expensive endpoint groups (retrieval and generation).
+    api_rate_limit: int = Field(default=120, alias="API_RATE_LIMIT")
+    api_rate_window_seconds: int = Field(default=60, alias="API_RATE_WINDOW_SECONDS")
+    api_search_rate_limit: int = Field(default=30, alias="API_SEARCH_RATE_LIMIT")
+    api_ask_rate_limit: int = Field(default=10, alias="API_ASK_RATE_LIMIT")
+    # auto -> Redis when reachable, in-process counters otherwise.
+    api_rate_limit_backend: str = Field(default="auto", alias="API_RATE_LIMIT_BACKEND")
+
+    # Paging and payload caps.
+    api_page_size: int = Field(default=20, alias="API_PAGE_SIZE")
+    api_max_page_size: int = Field(default=100, alias="API_MAX_PAGE_SIZE")
+    api_max_html_chars: int = Field(default=200_000, alias="API_MAX_HTML_CHARS")
+    # Load the ONNX embedding model at start-up instead of on the first
+    # search. Costs about a second of start-up and removes it from the first
+    # client request - worth it behind a readiness probe, which will simply
+    # hold the replica out of the load balancer until the model is in memory.
+    api_warm_embedder: bool = Field(default=False, alias="API_WARM_EMBEDDER")
 
     # ---------- Scraper behaviour ----------
     scraper_user_agent: str = Field(
