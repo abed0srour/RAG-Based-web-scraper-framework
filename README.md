@@ -69,8 +69,10 @@ A detailed per-phase flowchart is included in the project report
 | Worker monitoring | Flower, RabbitMQ management UI |
 | Embeddings | FastEmbed (ONNX Runtime, CPU-only) |
 | Vector store | Chroma (client/server mode) |
-| LLM | Anthropic Claude (`claude-sonnet-5-5`) |
+| Full-text search engine | Elasticsearch 8.17 (English analysis, highlights, facets) |
+| LLM | Anthropic Claude, with a free offline extractive provider as the default |
 | REST API | FastAPI + Uvicorn |
+| Web UI | React 18 + TypeScript, built with Vite 6 |
 | Metrics | prometheus-client |
 | Containerisation | Docker + Docker Compose |
 | Orchestration | Kubernetes |
@@ -114,16 +116,40 @@ A detailed per-phase flowchart is included in the project report
 │   │   ├── pipeline.py       Postgres -> clean -> normalise -> MongoDB
 │   │   ├── benchmark.py      Processing-efficiency test over different samples
 │   │   └── report.py         CLI report over the processed documents
-│   ├── worker/               Celery application and distributed tasks (Task 5)
-│   ├── rag/                  Chunking, embeddings, vector store, LLM (Task 4)
-│   └── api/                  FastAPI application (Task 6)
+│   ├── worker/               Celery application and distributed tasks
+│   ├── rag/
+│   │   ├── chunker.py        Overlapping word windows per document
+│   │   ├── embedder.py       Local ONNX embeddings (no API, no GPU)
+│   │   ├── vector_store.py   Chroma collection of chunk vectors
+│   │   ├── retriever.py      Vector / keyword / hybrid retrieval
+│   │   ├── llm.py            Extractive (free, default) and Claude providers
+│   │   ├── augment.py        Retrieve -> generate, with citations
+│   │   ├── indexer.py        MongoDB -> chunks -> Chroma
+│   │   └── report.py         CLI report over the vector index
+│   ├── search/
+│   │   ├── index.py          Elasticsearch mapping, queries and index wrapper
+│   │   ├── indexer.py        MongoDB -> Elasticsearch projection
+│   │   └── report.py         CLI report over the full-text index
+│   └── api/
+│       ├── main.py           Application factory, middleware, error handling
+│       ├── security.py       API keys and scopes
+│       ├── rate_limit.py     Per-key fixed windows (memory or Redis)
+│       ├── schemas.py        Request/response contract
+│       ├── metrics.py        Prometheus series for the HTTP surface
+│       └── routers/          raw, documents, search, fulltext, system
+├── ui/                       React + TypeScript web interface (Task 6)
+│   ├── src/lib/api.ts        The one place that talks to the API
+│   ├── src/components/       Search bar, facets, results, drawer, Ask, status
+│   └── vite.config.ts        Dev server and /v1 proxy to the API
 ├── scripts/
 │   ├── verify_env.py         Environment verification report (Task 1)
 │   ├── demo_task2.py         End-to-end Task 2 demonstration on two sites
-│   └── demo_task3.py         End-to-end Task 3 demonstration (cleaning -> index)
+│   ├── demo_task3.py         End-to-end Task 3 demonstration (cleaning -> index)
+│   ├── demo_task4.py         End-to-end Task 4 demonstration (RAG)
+│   └── demo_task6.py         End-to-end Task 6 demonstration (full-text search)
 ├── tests/                    pytest test-suite
 ├── docker/
-│   └── docker-compose.yml    RabbitMQ + PostgreSQL + MongoDB infrastructure
+│   └── docker-compose.yml    RabbitMQ, PostgreSQL, MongoDB, Chroma, Elasticsearch
 ├── k8s/                      Kubernetes manifests (deployments, services, HPA)
 ├── data/                     Local run artefacts and worker logs (git-ignored)
 └── docs/
@@ -474,16 +500,102 @@ this schema holds the page's HTML `lang` attribute, and a page declaring
 
 ---
 
+## Task 6 - Web UI and full-text search
+
+A React interface over the API, with its search box answered by
+**Elasticsearch** rather than by the stores the earlier tasks used.
+
+### Why a fourth store
+
+Each store answers a question the others cannot, and search is no exception:
+
+| Store | The question it answers |
+|-------|-------------------------|
+| PostgreSQL | "which rows have this value" - the crawl record |
+| MongoDB | "which documents contain these words" - its text index |
+| Chroma | "which passages are closest in meaning to this one" |
+| Elasticsearch | "give me the ranked pages for this phrase, the snippet from each showing why it matched, the counts per site, and the titles starting with what I have typed" |
+
+The last one is what a *search interface* needs, in one round trip. The
+demonstration script prints the same query run against MongoDB and against
+Elasticsearch side by side, so the difference is visible rather than claimed.
+
+### The index
+
+`src/search/index.py` owns the mapping, and four decisions in it matter:
+
+| Decision | Why |
+|----------|-----|
+| `dynamic: strict`, and `fields` stored with indexing **disabled** | The site-specific `fields` sub-document has a different shape per website. Mapping it dynamically is how an index grows thousands of fields and a cluster state too large to replicate. A flattened `fields_text` string keeps those values searchable as **one** field. |
+| An English `content` analyzer (lowercase, stop words, stemming) | A search for *drawing* matches *draw* and *draws* - which a substring or regular-expression scan over MongoDB cannot do. |
+| Edge n-grams on `title.suggest` at index time, plain analysis at query time | Makes an as-you-type query a term lookup rather than a wildcard scan, so it is cheap enough to call on every keystroke. |
+| `_id` is the `doc_id` | Re-indexing a page replaces it instead of adding a copy - the same idempotency MongoDB and Chroma have, needed because the frontier delivers a URL at least once. |
+
+Build it from the processed documents:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d elasticsearch
+python -m src.search.indexer              # project MongoDB into the index
+python -m src.search.indexer --rebuild    # after a mapping change
+python -m src.search.report --query "light in the attic"
+```
+
+### The endpoints the UI uses
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /v1/fulltext` | Ranked hits with `<mark>`ed fragments, facet counts over **all** matches, five sort orders, offset paging over an exact total |
+| `GET /v1/fulltext/suggest` | As-you-type suggestions |
+| `GET /v1/fulltext/sites` | The site filter, before anything has been typed |
+| `GET /v1/fulltext/similar/{doc_id}` | Lexically related pages (`more_like_this`) |
+
+All four need the `search` scope and share the search rate-limit window: the
+UI calls them on every keystroke, so they belong in the same budget.
+
+### The interface
+
+```bash
+cd ui
+npm install
+npm run dev        # http://localhost:5173, proxying /v1 to the API
+```
+
+Three tabs over three stores - **Search** (Elasticsearch), **Ask** (the RAG
+read path with citations), and **Raw data** (the PostgreSQL crawl record) -
+with a status bar that polls `/health/ready` so a partial outage is visible
+in the interface instead of only as a failed query.
+
+Four things in it are worth pointing at:
+
+| Detail | Why it is there |
+|--------|-----------------|
+| The query is debounced and every request is abortable | Typing *widgets* is seven state changes. Without cancellation the answer to *widg* can arrive after the answer to *widgets* and overwrite it. |
+| Highlight fragments are rendered as React nodes, never as HTML | Elasticsearch inserts `<mark>` into text that came from a **crawled page** and escapes nothing else. `dangerouslySetInnerHTML` here would be stored XSS with a payload supplied by whatever site was scraped. See `ui/src/lib/highlight.tsx`. |
+| Relevance is shown as a bar, not a number | An Elasticsearch score is unbounded and comparable only within one result set, so it is displayed relative to the best hit. |
+| Errors are read from the API's error envelope | A 403 says the key lacks the `search` scope; a 503 says Elasticsearch is down and gives the command to start it, with the request id that ties it to a log line. |
+
+### Tests
+
+`tests/test_search.py` tests the mapping, the projection and the query
+builders directly - they are pure functions from parameters to a dictionary,
+which is the search equivalent of asserting on generated SQL. The scoring,
+analysis, highlighting and facet behaviour is Elasticsearch's, so it is
+tested against a real cluster in its own index and skipped when none is
+running. `tests/test_api_fulltext.py` covers the HTTP contract with a fake
+index: auth, scopes, validation, paging caps, parameter pass-through and the
+503 translation.
+
+---
+
 ## Roadmap
 
 - [x] **Task 1** - Environment setup (Python, venv, Git/GitHub, Docker, Kubernetes)
 - [x] **Task 2** - Web scraping module (Scrapy, BeautifulSoup/lxml, RabbitMQ, PostgreSQL)
 - [x] **Task 3** - Data processing module (cleaning, JSON normalisation, MongoDB indexing)
-- [ ] **Task 4** - RAG integration (chunking, embeddings, vector store, LLM)
-- [ ] **Task 5** - Fault tolerance and load balancing
-- [ ] **Task 6** - REST APIs for data retrieval and analysis
-- [ ] **Task 7** - Docker / Kubernetes deployment
-- [ ] **Task 8** - Testing on two different websites
+- [x] **Task 4** - RAG integration (chunking, embeddings, Chroma, grounded summaries)
+- [x] **Task 5** - REST API for data access (FastAPI, API keys, rate limiting)
+- [x] **Task 6** - Web UI and full-text search (React, Elasticsearch)
+- [ ] **Task 7** - Load balancing and fault tolerance (Nginx/HAProxy, Kafka, Kubernetes auto-restart, Prometheus/Grafana)
 
 ---
 

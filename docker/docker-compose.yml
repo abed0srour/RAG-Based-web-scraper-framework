@@ -6,6 +6,7 @@
 #   mongodb   : NoSQL store for the cleaned, normalised JSON documents
 #   mongo-express : web UI for browsing the document collection
 #   chroma    : vector database holding the embedded text chunks (RAG)
+#   elasticsearch : full-text search index behind the web UI (Task 6)
 #
 # Start with:   docker compose -f docker/docker-compose.yml up -d
 # Inspect with: docker compose -f docker/docker-compose.yml ps
@@ -133,8 +134,56 @@ services:
       retries: 12
       start_period: 20s
 
+  elasticsearch:
+    # The full-text search engine behind the web UI (Task 6). MongoDB's text
+    # index can tell you which documents contain a word; this answers what a
+    # search interface actually asks - ranked hits, highlighted snippets,
+    # facet counts per site and as-you-type suggestions, in one request.
+    #
+    # The client in requirements.txt is pinned to the same major version
+    # (8.17): an 8.x client refuses to talk to a 7.x or 9.x cluster.
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    container_name: rag-elasticsearch
+    restart: unless-stopped
+    ports:
+      - "9200:9200"      # REST API  (http://localhost:9200)
+    environment:
+      # A single node, so no quorum to form and no replica to allocate.
+      discovery.type: single-node
+      # Security off: this is a development cluster on localhost, and TLS
+      # plus a bootstrap password would add two setup steps that teach
+      # nothing about search. A real deployment turns this back on, sets
+      # ELASTIC_USER/ELASTIC_PASSWORD and switches ELASTIC_SCHEME to https.
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      # Elasticsearch sizes its heap from the container's memory by default
+      # and will happily take gigabytes. 1 GB is plenty for these corpora.
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      # Machine learning is on by default and costs memory this index has no
+      # use for.
+      xpack.ml.enabled: "false"
+      ingest.geoip.downloader.enabled: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    mem_limit: 2g
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data
+    healthcheck:
+      # "yellow" is a healthy single node: with number_of_replicas 0 the
+      # index is green, but system indices created by the cluster itself ask
+      # for a replica that a one-node cluster cannot place.
+      test: ["CMD-SHELL",
+             "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 60s
+
 volumes:
   rabbitmq_data:
   postgres_data:
   mongo_data:
   chroma_data:
+  elastic_data:

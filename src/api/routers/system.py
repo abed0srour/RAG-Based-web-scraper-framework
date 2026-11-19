@@ -92,6 +92,22 @@ def _check_chroma() -> dict[str, str | None]:
     return {"status": "down", "detail": "vector search will fall back to keyword only"}
 
 
+def _check_elasticsearch() -> dict[str, str | None]:
+    from src.search.index import SearchIndex
+
+    index = SearchIndex()
+    if index.ping():
+        try:
+            documents = index.count()
+        except Exception:  # noqa: BLE001 - a probe reports, never raises
+            documents = 0
+        return {
+            "status": "up",
+            "detail": f"index {index.index_name} ({documents} documents)",
+        }
+    return {"status": "down", "detail": "full-text search and the web UI will fail"}
+
+
 def _check_llm() -> dict[str, str | None]:
     try:
         from src.rag.llm import get_llm
@@ -130,11 +146,12 @@ def readiness(response: Response) -> Any:
         "postgres": _check_postgres(),
         "mongodb": _check_mongo(),
         "chroma": _check_chroma(),
+        "elasticsearch": _check_elasticsearch(),
         "llm": _check_llm(),
         "rate_limiter": _check_rate_limiter(),
     }
 
-    stores = ("postgres", "mongodb", "chroma")
+    stores = ("postgres", "mongodb", "chroma", "elasticsearch")
     stores_up = [name for name in stores if checks[name]["status"] == "up"]
 
     if not stores_up:

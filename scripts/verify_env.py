@@ -161,9 +161,10 @@ def check_cluster() -> None:
 
 
 def check_services() -> None:
-    """RabbitMQ, PostgreSQL, MongoDB and Chroma reachability (informational).
+    """Broker, database and search-engine reachability (informational).
 
-    All four run as containers from ``docker/docker-compose.yml``; start them
+    RabbitMQ, PostgreSQL, MongoDB, Chroma and Elasticsearch: all five run as
+    containers from ``docker/docker-compose.yml``; start them
     with ``docker compose -f docker/docker-compose.yml up -d``.
     """
     header("5. BACKING SERVICES (broker / databases)")
@@ -235,6 +236,23 @@ def check_services() -> None:
         print(f"{BAD} Chroma           : not reachable ({type(exc).__name__})")
         print("       start it with: docker compose -f docker/docker-compose.yml "
               "up -d chroma")
+
+    # --- Elasticsearch (the full-text index of Task 6) ---
+    try:
+        from src.search.index import SearchIndex
+
+        search = SearchIndex()
+        if not search.ping():
+            raise RuntimeError("ping failed")
+        print(f"{OK} Elasticsearch    : {search.server_version()}")
+        health = search.health()
+        print(f"       cluster status         {health['status']}")
+        print(f"       index                  {health['index']}")
+        print(f"       documents indexed      {health['documents']}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{BAD} Elasticsearch    : not reachable ({type(exc).__name__})")
+        print("       start it with: docker compose -f docker/docker-compose.yml "
+              "up -d elasticsearch")
 
     # --- The embedding model (local, no service) ---
     try:

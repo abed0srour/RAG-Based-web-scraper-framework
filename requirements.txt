@@ -42,6 +42,11 @@ numpy==1.26.4
 # --- LLM provider (Anthropic Claude) ---
 anthropic==0.42.0
 
+# --- Full-text search : Elasticsearch (Task 6) ---
+# The client major version must match the server major version; the cluster
+# in docker/docker-compose.yml is 8.17.
+elasticsearch==8.17.0
+
 # --- REST API layer ---
 fastapi==0.115.6
 uvicorn[standard]==0.34.0

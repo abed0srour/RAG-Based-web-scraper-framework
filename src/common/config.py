@@ -94,6 +94,32 @@ class Settings(BaseSettings):
     rag_index_batch_size: int = Field(default=128, alias="RAG_INDEX_BATCH_SIZE")
     rag_context_chars: int = Field(default=6000, alias="RAG_CONTEXT_CHARS")
 
+    # ---------- Full-text search : Elasticsearch (Task 6) ----------
+    # The fourth store. MongoDB's text index answers "which documents contain
+    # these words"; Elasticsearch answers the question a search *interface*
+    # asks - ranked hits with highlighted snippets, facet counts and
+    # as-you-type suggestions - which is why the UI searches here.
+    elastic_host: str = Field(default="localhost", alias="ELASTIC_HOST")
+    elastic_port: int = Field(default=9200, alias="ELASTIC_PORT")
+    elastic_scheme: str = Field(default="http", alias="ELASTIC_SCHEME")
+    # Security is off in the development cluster, so these are empty by
+    # default; a real deployment sets both and switches the scheme to https.
+    elastic_user: str = Field(default="", alias="ELASTIC_USER")
+    elastic_password: str = Field(default="", alias="ELASTIC_PASSWORD")
+    elastic_index: str = Field(default="scraped_documents", alias="ELASTIC_INDEX")
+    elastic_timeout: int = Field(default=30, alias="ELASTIC_TIMEOUT")
+    elastic_index_batch_size: int = Field(
+        default=200, alias="ELASTIC_INDEX_BATCH_SIZE"
+    )
+    # Characters of each document's text sent to the index. The stored text is
+    # unbounded; a highlighted snippet never needs the whole of a long page.
+    elastic_max_text_chars: int = Field(default=60_000, alias="ELASTIC_MAX_TEXT_CHARS")
+    # Snippet count and width for the highlighter.
+    elastic_highlight_fragments: int = Field(
+        default=3, alias="ELASTIC_HIGHLIGHT_FRAGMENTS"
+    )
+    elastic_highlight_size: int = Field(default=180, alias="ELASTIC_HIGHLIGHT_SIZE")
+
     # ---------- API (Task 5) ----------
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8080, alias="API_PORT")

@@ -52,7 +52,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api import metrics, rate_limit
 from src.api.rate_limit import enforce_request_limit
-from src.api.routers import documents, raw, search, system
+from src.api.routers import documents, fulltext, raw, search, system
 from src.api.security import describe_keys
 from src.common.config import settings
 from src.common.logging_config import quiet_noisy_loggers
@@ -69,6 +69,9 @@ REST interface to the distributed RAG web-scraping framework.
   stage added to them.
 * **Search** (`/v1/search`, `/v1/ask`) - vector, keyword and hybrid retrieval
   over the chunk index, and grounded question answering with citations.
+* **Full-text search** (`/v1/fulltext`) - Elasticsearch: ranked documents
+  with highlighted snippets, facet counts per site, as-you-type suggestions
+  and lexical "more like this". This is what the web UI searches.
 
 **Authentication.** Every `/v1` endpoint needs an API key, sent either as
 `X-API-Key: <key>` or as `Authorization: Bearer <key>`. Keys carry scopes
@@ -83,6 +86,7 @@ and generation; every response carries `X-RateLimit-*` headers.
 UNAVAILABLE_TYPES = {
     "StoreUnavailable": "document_store_unavailable",
     "VectorStoreUnavailable": "vector_store_unavailable",
+    "SearchUnavailable": "search_index_unavailable",
     "EmbeddingUnavailable": "embedding_model_unavailable",
     "OperationalError": "database_unavailable",
     "DBAPIError": "database_unavailable",
@@ -228,6 +232,7 @@ def create_app() -> FastAPI:
     v1.include_router(raw.router)
     v1.include_router(documents.router)
     v1.include_router(search.router)
+    v1.include_router(fulltext.router)
     v1.include_router(system.me_router)
     app.include_router(v1)
 

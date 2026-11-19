@@ -98,7 +98,20 @@ def get_vector_store() -> Any:
     return VectorStore()
 
 
+def get_search_index_dep() -> Any:
+    """The Elasticsearch full-text index (Task 6).
+
+    Shared like the others: the client owns a connection pool, and building
+    one per request would discard it. Imported lazily so that an API serving
+    only the crawl endpoints does not need the search client at import time.
+    """
+    from src.search.index import get_search_index
+
+    return get_search_index()
+
+
 RepositoryDep = Annotated[type[ScrapeRepository], Depends(get_repository)]
 StoreDep = Annotated[DocumentStore, Depends(get_document_store)]
 RetrieverDep = Annotated[Any, Depends(get_retriever_dep)]
 VectorStoreDep = Annotated[Any, Depends(get_vector_store)]
+SearchIndexDep = Annotated[Any, Depends(get_search_index_dep)]

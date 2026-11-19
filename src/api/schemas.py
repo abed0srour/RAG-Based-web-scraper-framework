@@ -308,6 +308,88 @@ class SearchResponse(BaseModel):
     chunks: list[SearchHit] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Full-text search (Task 6: Elasticsearch)
+# ---------------------------------------------------------------------------
+
+
+class FacetBucket(BaseModel):
+    """One facet value and how many of the matching documents carry it."""
+
+    value: Any = Field(description="The site, language, keyword or flag")
+    count: int
+
+
+class FullTextHit(BaseModel):
+    """One document from the full-text index, with its highlighted snippets.
+
+    ``extra="allow"`` for the same reason as :class:`DocumentSummary`: the
+    site-specific ``fields`` sub-document differs per website and is returned
+    as it is stored.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    doc_id: str
+    url: str
+    site: str | None = None
+    path: str | None = None
+    title: str | None = None
+    description: str | None = None
+    language: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    headings: list[str] = Field(default_factory=list)
+    word_count: int | None = None
+    reading_time_sec: int | None = None
+    processed_at: str | None = None
+    fetched_at: str | None = None
+    http_status: int | None = None
+    depth: int | None = None
+    summary: str | None = None
+    enriched: bool = False
+    quality_score: float | None = None
+    fields: dict[str, Any] = Field(default_factory=dict)
+    rank: int
+    score: float = Field(description="The Elasticsearch relevance score (unbounded)")
+    relevance: float | None = Field(
+        default=None,
+        description="score as a fraction of the best hit in this result set, 0..1",
+    )
+    highlights: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Matched fragments per field, with <mark> around the terms",
+    )
+    snippet: str = Field(
+        default="", description="The one fragment best suited to a result card"
+    )
+
+
+class FullTextResponse(BaseModel):
+    """A page of full-text results, with the facet counts over all matches."""
+
+    query: str
+    sort: str
+    total: int = Field(description="Matching documents, not just the ones returned")
+    returned: int
+    took_ms: float = Field(description="Time spent inside the cluster")
+    elapsed_ms: float = Field(description="Round trip including the network")
+    hits: list[FullTextHit] = Field(default_factory=list)
+    facets: dict[str, list[FacetBucket]] = Field(
+        default_factory=dict,
+        description="Counts per site, language, keyword and enrichment state",
+    )
+    notes: list[str] = Field(default_factory=list)
+
+
+class SuggestionModel(BaseModel):
+    """One as-you-type suggestion."""
+
+    text: str
+    doc_id: str | None = None
+    url: str | None = None
+    site: str | None = None
+
+
 class AskRequest(BaseModel):
     """A question for the RAG pipeline."""
 
