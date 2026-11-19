@@ -365,3 +365,64 @@ class DocumentStore:
             },
             "indexes": [index["name"] for index in self.indexes()],
         }
+
+    # ---------------- read side (used by the Task 5 API) ----------------
+
+    def list_documents(
+        self,
+        *,
+        site: str | None = None,
+        enriched: bool | None = None,
+        min_words: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        projection: Iterable[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page through the processed documents, newest first.
+
+        The sort is ``site + processed_at`` when a site filter is given, which
+        is exactly the compound index created by :meth:`ensure_indexes`, so a
+        listing is served from the index rather than by scanning and sorting
+        the collection in memory.
+
+        Returns ``(documents, total)``; the total is what lets the API tell a
+        client how many pages of results exist.
+        """
+        filters: dict[str, Any] = {}
+        if site:
+            filters["site"] = site
+        if enriched is True:
+            filters["enrichment.summary"] = {"$exists": True, "$ne": ""}
+        elif enriched is False:
+            filters["$or"] = [
+                {"enrichment": {"$exists": False}},
+                {"enrichment.summary": ""},
+            ]
+        if min_words is not None:
+            filters["stats.word_count"] = {"$gte": min_words}
+
+        fields: dict[str, Any] = {"_id": 0}
+        if projection:
+            fields.update({name: 1 for name in projection})
+
+        total = self.collection.count_documents(filters)
+        cursor = (
+            self.collection.find(filters, fields)
+            .sort([("processing.processed_at", -1), ("doc_id", 1)])
+            .skip(max(offset, 0))
+            .limit(max(limit, 0))
+        )
+        return list(cursor), total
+
+    def get_enrichment(self, doc_id: str) -> dict[str, Any] | None:
+        """The enrichment sub-document only, or None when not yet generated."""
+        document = self.collection.find_one(
+            {"doc_id": doc_id}, {"_id": 0, "doc_id": 1, "url": 1, "enrichment": 1}
+        )
+        if document is None or not document.get("enrichment"):
+            return None
+        return document
+
+    def sites(self) -> list[str]:
+        """Every site present in the collection, for the filter documentation."""
+        return sorted(str(site) for site in self.collection.distinct("site"))

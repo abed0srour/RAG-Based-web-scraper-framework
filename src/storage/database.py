@@ -325,3 +325,311 @@ class ScrapeRepository:
                     ).scalar_one(),
                 },
             }
+
+    # ---------------- read side (used by the Task 5 API) ----------------
+    #
+    # Everything below is query-only. It lives in the storage layer rather
+    # than in the API routers for the same reason the writes do: the SQL
+    # belongs next to the schema that defines it, so a column rename is a
+    # one-file change, and the HTTP layer stays a thin translation of
+    # requests into calls on this repository.
+    #
+    # Every listing takes limit/offset and returns a total count alongside
+    # the rows: an endpoint that cannot tell a client how much data exists
+    # cannot be paged through safely.
+
+    @staticmethod
+    def list_jobs(
+        *,
+        site: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Crawl runs, newest first, with the total number of matches."""
+        with session_scope() as s:
+            filters = []
+            if site:
+                filters.append(CrawlJob.site == site)
+            if status:
+                filters.append(CrawlJob.status == status)
+
+            total = s.execute(
+                select(func.count()).select_from(CrawlJob).where(*filters)
+            ).scalar_one()
+
+            rows = (
+                s.execute(
+                    select(CrawlJob)
+                    .where(*filters)
+                    .order_by(CrawlJob.started_at.desc(), CrawlJob.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+                .scalars()
+                .all()
+            )
+
+            return [
+                {
+                    "id": job.id,
+                    "job_name": job.job_name,
+                    "site": job.site,
+                    "seed_urls": list(job.seed_urls or []),
+                    "status": job.status,
+                    "pages_scraped": job.pages_scraped,
+                    "pages_failed": job.pages_failed,
+                    "started_at": job.started_at,
+                    "finished_at": job.finished_at,
+                }
+                for job in rows
+            ], total
+
+    @staticmethod
+    def list_raw_pages(
+        *,
+        site: str | None = None,
+        job_id: int | None = None,
+        http_status: int | None = None,
+        url_contains: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Raw-page metadata, newest first, without the HTML body.
+
+        The body of a single page can be hundreds of kilobytes, so a listing
+        returns only the metadata and the content hash; the full HTML is
+        fetched one page at a time from the detail endpoint.
+        """
+        with session_scope() as s:
+            filters = []
+            if site:
+                filters.append(RawPage.site == site)
+            if job_id is not None:
+                filters.append(RawPage.job_id == job_id)
+            if http_status is not None:
+                filters.append(RawPage.http_status == http_status)
+            if url_contains:
+                filters.append(RawPage.url.ilike(f"%{url_contains}%"))
+
+            total = s.execute(
+                select(func.count()).select_from(RawPage).where(*filters)
+            ).scalar_one()
+
+            rows = (
+                s.execute(
+                    select(
+                        RawPage.id,
+                        RawPage.job_id,
+                        RawPage.url,
+                        RawPage.site,
+                        RawPage.depth,
+                        RawPage.http_status,
+                        RawPage.content_type,
+                        RawPage.content_length,
+                        RawPage.content_hash,
+                        RawPage.fetched_at,
+                        RawPage.fetched_by,
+                    )
+                    .where(*filters)
+                    .order_by(RawPage.fetched_at.desc(), RawPage.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+                .mappings()
+                .all()
+            )
+
+            return [dict(row) for row in rows], total
+
+    @staticmethod
+    def get_raw_page(
+        page_id: int,
+        *,
+        include_html: bool = True,
+        max_html_chars: int | None = None,
+    ) -> dict[str, Any] | None:
+        """One raw page, optionally with its (possibly truncated) HTML body."""
+        with session_scope() as s:
+            page = s.get(RawPage, page_id)
+            if page is None:
+                return None
+
+            record: dict[str, Any] = {
+                "id": page.id,
+                "job_id": page.job_id,
+                "url": page.url,
+                "site": page.site,
+                "depth": page.depth,
+                "http_status": page.http_status,
+                "content_type": page.content_type,
+                "headers": dict(page.headers or {}),
+                "content_length": page.content_length,
+                "content_hash": page.content_hash,
+                "fetched_at": page.fetched_at,
+                "fetched_by": page.fetched_by,
+                "raw_html": None,
+                "html_truncated": False,
+            }
+
+            if include_html:
+                html = page.raw_html or ""
+                if max_html_chars is not None and len(html) > max_html_chars:
+                    record["raw_html"] = html[:max_html_chars]
+                    record["html_truncated"] = True
+                else:
+                    record["raw_html"] = html
+            return record
+
+    @staticmethod
+    def get_raw_page_html(page_id: int) -> tuple[str, str] | None:
+        """(html, content_type) for one page, for the raw-HTML endpoint."""
+        from sqlalchemy import text as sql_text  # noqa: F401  (kept local)
+
+        with session_scope() as s:
+            row = s.execute(
+                select(RawPage.raw_html, RawPage.content_type).where(
+                    RawPage.id == page_id
+                )
+            ).first()
+            if row is None:
+                return None
+            return row[0] or "", row[1] or "text/html"
+
+    @staticmethod
+    def list_parsed_pages(
+        *,
+        site: str | None = None,
+        min_words: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_text: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The parsed (extracted) view of the crawl."""
+        with session_scope() as s:
+            filters = []
+            if site:
+                filters.append(ParsedPage.site == site)
+            if min_words is not None:
+                filters.append(ParsedPage.word_count >= min_words)
+
+            total = s.execute(
+                select(func.count()).select_from(ParsedPage).where(*filters)
+            ).scalar_one()
+
+            columns = [
+                ParsedPage.id,
+                ParsedPage.raw_page_id,
+                ParsedPage.url,
+                ParsedPage.site,
+                ParsedPage.title,
+                ParsedPage.description,
+                ParsedPage.language,
+                ParsedPage.headings,
+                ParsedPage.word_count,
+                ParsedPage.structured_data,
+                ParsedPage.parser_used,
+                ParsedPage.parsed_at,
+            ]
+            if include_text:
+                columns.append(ParsedPage.clean_text)
+
+            rows = (
+                s.execute(
+                    select(*columns)
+                    .where(*filters)
+                    .order_by(ParsedPage.parsed_at.desc(), ParsedPage.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+                .mappings()
+                .all()
+            )
+
+            return [dict(row) for row in rows], total
+
+    @staticmethod
+    def get_parsed_page(raw_page_id: int) -> dict[str, Any] | None:
+        """The parsed view of one raw page, including its clean text."""
+        with session_scope() as s:
+            row = s.execute(
+                select(ParsedPage).where(ParsedPage.raw_page_id == raw_page_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "raw_page_id": row.raw_page_id,
+                "url": row.url,
+                "site": row.site,
+                "title": row.title,
+                "description": row.description,
+                "language": row.language,
+                "headings": list(row.headings or []),
+                "clean_text": row.clean_text,
+                "word_count": row.word_count,
+                "structured_data": dict(row.structured_data or {}),
+                "parser_used": row.parser_used,
+                "parsed_at": row.parsed_at,
+            }
+
+    @staticmethod
+    def list_links(
+        *,
+        site: str | None = None,
+        source_url: str | None = None,
+        enqueued: bool | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The frontier audit trail: which page produced which URL."""
+        with session_scope() as s:
+            filters = []
+            if site:
+                filters.append(DiscoveredLink.site == site)
+            if source_url:
+                filters.append(DiscoveredLink.source_url == source_url)
+            if enqueued is not None:
+                filters.append(DiscoveredLink.enqueued == enqueued)
+
+            total = s.execute(
+                select(func.count()).select_from(DiscoveredLink).where(*filters)
+            ).scalar_one()
+
+            rows = (
+                s.execute(
+                    select(
+                        DiscoveredLink.id,
+                        DiscoveredLink.source_url,
+                        DiscoveredLink.target_url,
+                        DiscoveredLink.site,
+                        DiscoveredLink.anchor_text,
+                        DiscoveredLink.depth,
+                        DiscoveredLink.enqueued,
+                        DiscoveredLink.discovered_at,
+                    )
+                    .where(*filters)
+                    .order_by(
+                        DiscoveredLink.discovered_at.desc(), DiscoveredLink.id.desc()
+                    )
+                    .limit(limit)
+                    .offset(offset)
+                )
+                .mappings()
+                .all()
+            )
+
+            return [dict(row) for row in rows], total
+
+    @staticmethod
+    def ping() -> bool:
+        """True when PostgreSQL answers - used by the API readiness probe."""
+        from sqlalchemy import text as sql_text
+
+        try:
+            with get_engine().connect() as connection:
+                connection.execute(sql_text("SELECT 1"))
+            return True
+        except Exception as exc:  # noqa: BLE001 - any driver error means "down"
+            logger.warning("PostgreSQL ping failed: %s", exc)
+            return False
