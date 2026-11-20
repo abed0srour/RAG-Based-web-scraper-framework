@@ -44,6 +44,14 @@ chromadb-client==0.5.23
 # --- RAG : embeddings (ONNX Runtime, CPU-only, no PyTorch) ---
 fastembed==0.4.2
 numpy==1.26.4
+# Pinned because of the model *download* path, not the library itself.
+# huggingface_hub draws its progress bar through tqdm._lock, which tqdm
+# 4.70 no longer exposes, so on a machine that has not cached the model yet
+# the first embedding load dies with "type object 'tqdm' has no attribute
+# '_lock'" and retrieval silently degrades to keyword-only. A machine that
+# already has the model never goes down that path, which is why this only
+# ever appears on a fresh install or a cold container.
+tqdm==4.67.1
 
 # --- LLM provider (Anthropic Claude) ---
 anthropic==0.42.0

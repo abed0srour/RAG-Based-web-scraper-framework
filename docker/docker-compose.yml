@@ -296,6 +296,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      # The ONNX embedding weights, shared from the host. Without this each
+      # replica downloads the same 45 MB on its first embedding call, which
+      # makes the first /v1/ask take tens of seconds and leaves vector
+      # search degraded to keyword-only until the download finishes. Three
+      # replicas means three downloads of identical bytes the host already
+      # has.
+      - ../data/models:/app/data/models
     expose:
       - "8080"
 
